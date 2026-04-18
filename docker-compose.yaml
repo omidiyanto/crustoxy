@@ -2,7 +2,8 @@ version: '3.8'
 
 services:
   crustoxy:
-    image: ghcr.io/omidiyanto/crustoxy:latest
+    build: .
+    # image: ghcr.io/omidiyanto/crustoxy:latest
     container_name: crustoxy
     restart: unless-stopped
     ports:
