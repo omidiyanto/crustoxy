@@ -66,16 +66,12 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }}
       
-      - name: Install gcc-multilib/i686 headers (Linux 32-bit)
-        if: ${{ matrix.platform.target == 'i686-unknown-linux-gnu' }}
-        run: sudo apt-get update && sudo apt-get install -y gcc-multilib build-essential pkg-config libssl-dev:i386
-
-      - name: Add i386 architecture for OpenSSL
+      - name: Install i686 dependencies (Linux 32-bit)
         if: ${{ matrix.platform.target == 'i686-unknown-linux-gnu' }}
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y libssl-dev:i386
+          sudo apt-get install -y gcc-multilib build-essential pkg-config libssl-dev:i386
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
