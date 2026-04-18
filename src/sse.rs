@@ -249,9 +249,10 @@ impl SSEBuilder {
         let tool_indices: Vec<i32> = self.blocks.tool_states.keys().cloned().collect();
         for tool_index in tool_indices {
             if let Some(state) = self.blocks.tool_states.get(&tool_index)
-                && state.started {
-                    events.push(self.content_block_stop(state.block_index as u32));
-                }
+                && state.started
+            {
+                events.push(self.content_block_stop(state.block_index as u32));
+            }
         }
         events
     }

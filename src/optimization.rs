@@ -194,9 +194,7 @@ fn extract_filepaths(command: &str, output: &str) -> String {
             || trimmed.starts_with("../")
             || (trimmed.contains('/') && !trimmed.contains(' ') && !trimmed.starts_with('#'))
         {
-            let path = trimmed
-                .trim_start_matches(['+', '-', ' '])
-                .trim();
+            let path = trimmed.trim_start_matches(['+', '-', ' ']).trim();
             if !path.is_empty() && !paths.contains(&path.to_string()) {
                 paths.push(path.to_string());
             }

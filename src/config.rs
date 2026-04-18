@@ -197,17 +197,20 @@ impl Settings {
     pub fn resolve_model(&self, claude_model: &str) -> String {
         let lower = claude_model.to_lowercase();
         if lower.contains("opus")
-            && let Some(ref m) = self.model_opus {
-                return m.clone();
-            }
+            && let Some(ref m) = self.model_opus
+        {
+            return m.clone();
+        }
         if lower.contains("haiku")
-            && let Some(ref m) = self.model_haiku {
-                return m.clone();
-            }
+            && let Some(ref m) = self.model_haiku
+        {
+            return m.clone();
+        }
         if lower.contains("sonnet")
-            && let Some(ref m) = self.model_sonnet {
-                return m.clone();
-            }
+            && let Some(ref m) = self.model_sonnet
+        {
+            return m.clone();
+        }
         self.model.clone()
     }
 
@@ -216,7 +219,10 @@ impl Settings {
     }
 
     pub fn parse_model_name(model_string: &str) -> &str {
-        model_string.split_once('/').map(|x| x.1).unwrap_or(model_string)
+        model_string
+            .split_once('/')
+            .map(|x| x.1)
+            .unwrap_or(model_string)
     }
 }
 

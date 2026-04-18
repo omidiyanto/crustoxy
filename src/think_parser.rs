@@ -52,17 +52,18 @@ impl ThinkTagParser {
         let orphan_close = self.buffer.find(CLOSE_TAG);
 
         if let Some(oc) = orphan_close
-            && (think_start.is_none() || oc < think_start.unwrap()) {
-                let pre = self.buffer[..oc].to_string();
-                self.buffer = self.buffer[oc + CLOSE_TAG_LEN..].to_string();
-                if !pre.is_empty() {
-                    return Some(ContentChunk {
-                        content_type: ContentType::Text,
-                        content: pre,
-                    });
-                }
-                return None;
+            && (think_start.is_none() || oc < think_start.unwrap())
+        {
+            let pre = self.buffer[..oc].to_string();
+            self.buffer = self.buffer[oc + CLOSE_TAG_LEN..].to_string();
+            if !pre.is_empty() {
+                return Some(ContentChunk {
+                    content_type: ContentType::Text,
+                    content: pre,
+                });
             }
+            return None;
+        }
 
         match think_start {
             None => {

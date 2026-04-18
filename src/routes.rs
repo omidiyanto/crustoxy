@@ -69,8 +69,7 @@ pub async fn create_message(
         .provider
         .stream_response(&request, input_tokens, &request_id);
 
-    let body_stream =
-        tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
+    let body_stream = tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
 
     Response::builder()
         .status(200)
