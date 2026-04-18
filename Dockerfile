@@ -4,7 +4,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg && \
@@ -13,11 +13,10 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y --no-install-recommends cloudflare-warp && \
     rm -rf /var/lib/apt/lists/*
-
 COPY --from=builder /build/target/release/crustoxy /usr/local/bin/crustoxy
-
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 ENV HOST=0.0.0.0
 ENV PORT=8082
 EXPOSE 8082
-
-ENTRYPOINT ["crustoxy"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
