@@ -1,0 +1,8 @@
+target/
+.git
+.env
+Dockerfile
+docker-compose.yaml
+README.md
+LICENSE.md
+.github/

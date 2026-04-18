@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  crustoxy:
+    build: .
+    container_name: crustoxy
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env
+    # Note: NET_ADMIN capability and /dev/net/tun device are required 
+    # for Cloudflare WARP to properly establish a connection inside the container.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - ENABLE_IP_ROTATION=true
