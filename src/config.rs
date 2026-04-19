@@ -81,7 +81,7 @@ pub const PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
         name: "siliconflow",
         env_prefix: "SILICONFLOW",
-        default_base_url: "https://api.siliconflow.cn/v1",
+        default_base_url: "https://api.siliconflow.com/v1",
     },
     ProviderDef {
         name: "novita",
