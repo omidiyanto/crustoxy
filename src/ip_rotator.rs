@@ -36,7 +36,7 @@ pub async fn rotate_ip() -> Result<(), String> {
     info!("Starting IP rotation via WARP...");
 
     info!("Disconnecting WARP...");
-    let _ = run_cmd("warp-cli", &["disconnect"]).await;
+    let _ = run_cmd("warp-cli", &["--accept-tos", "disconnect"]).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     match run_cmd("curl", &["-s", "--max-time", "5", "https://ifconfig.me"]).await {
@@ -55,14 +55,14 @@ pub async fn rotate_ip() -> Result<(), String> {
     }
 
     info!("Connecting WARP...");
-    if let Err(e) = run_cmd("warp-cli", &["connect"]).await {
+    if let Err(e) = run_cmd("warp-cli", &["--accept-tos", "connect"]).await {
         error!("Failed to connect WARP: {}", e);
         return Err(e);
     }
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    match run_cmd("warp-cli", &["status"]).await {
+    match run_cmd("warp-cli", &["--accept-tos", "status"]).await {
         Ok(status) => info!("WARP status: {}", status),
         Err(e) => warn!("Could not get WARP status: {}", e),
     }
