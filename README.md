@@ -128,7 +128,7 @@ No need to figure out endpoint definitions. Just pop in your `API_KEY` for any o
 | **OpenRouter** | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
 | **Groq** | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
 | **DeepSeek** | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/v1` |
-| **Google Gemini** | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/...` |
+| **Google Gemini** | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | **Together AI** | `TOGETHER_API_KEY` | `https://api.together.xyz/v1` |
 | **Hugging Face** | `HUGGINGFACE_API_KEY` | `https://router.huggingface.co/v1` |
 | **Mistral AI** | `MISTRAL_API_KEY` | `https://api.mistral.ai/v1` |

@@ -86,7 +86,7 @@ pub const PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
         name: "novita",
         env_prefix: "NOVITA",
-        default_base_url: "https://api.novita.ai/v3/openai",
+        default_base_url: "https://api.novita.ai/openai",
     },
     ProviderDef {
         name: "nvidia_nim",
