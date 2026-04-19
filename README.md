@@ -130,7 +130,7 @@ No need to figure out endpoint definitions. Just pop in your `API_KEY` for any o
 | **DeepSeek** | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/v1` |
 | **Google Gemini** | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/...` |
 | **Together AI** | `TOGETHER_API_KEY` | `https://api.together.xyz/v1` |
-| **Hugging Face** | `HUGGINGFACE_API_KEY` | `https://api-inference.huggingface.co/v1` |
+| **Hugging Face** | `HUGGINGFACE_API_KEY` | `https://router.huggingface.co/v1` |
 | **Mistral AI** | `MISTRAL_API_KEY` | `https://api.mistral.ai/v1` |
 | **Perplexity** | `PERPLEXITY_API_KEY`| `https://api.perplexity.ai` |
 | **Fireworks AI** | `FIREWORKS_API_KEY` | `https://api.fireworks.ai/inference/v1` |

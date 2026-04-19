@@ -41,7 +41,7 @@ pub const PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
         name: "huggingface",
         env_prefix: "HUGGINGFACE",
-        default_base_url: "https://api-inference.huggingface.co/v1",
+        default_base_url: "https://router.huggingface.co/v1",
     },
     ProviderDef {
         name: "mistral",
