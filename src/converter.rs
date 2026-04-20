@@ -172,12 +172,11 @@ pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
             if let Some(obj) = t.input_schema.as_object() {
                 if obj.is_empty() {
                     parameters = None;
-                } else if let Some(props) = obj.get("properties") {
-                    if props.as_object().is_some_and(|o| o.is_empty())
-                        && obj.get("required").is_none()
-                    {
-                        parameters = None;
-                    }
+                } else if let Some(props) = obj.get("properties")
+                    && props.as_object().is_some_and(|o| o.is_empty())
+                    && obj.get("required").is_none()
+                {
+                    parameters = None;
                 }
             }
 
