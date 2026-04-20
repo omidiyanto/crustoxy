@@ -111,7 +111,15 @@ pub struct Tool {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default = "default_input_schema")]
     pub input_schema: Value,
+}
+
+fn default_input_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {}
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
