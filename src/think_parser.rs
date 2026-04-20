@@ -13,10 +13,7 @@ pub struct ThinkTagParser {
     current_close_tag: Option<&'static str>,
 }
 
-const TAG_PAIRS: &[(&str, &str)] = &[
-    ("<think>", "</think>"),
-    ("<thought>", "</thought>"),
-];
+const TAG_PAIRS: &[(&str, &str)] = &[("<think>", "</think>"), ("<thought>", "</thought>")];
 
 impl ThinkTagParser {
     pub fn new() -> Self {
