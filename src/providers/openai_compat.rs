@@ -308,8 +308,7 @@ impl OpenAICompatProvider {
                                                     .map(|s| s.name.clone())
                                                     .unwrap_or_default();
 
-                                                // If we have args but no name yet, defer starting
-                                                if name.is_empty() && tc.id.is_none() 
+                                                if name.is_empty() && tc.id.is_none()
                                                     && let Some(ref func) = tc.function
                                                     && func.arguments.as_ref().is_some_and(|a| !a.is_empty())
                                                 {
