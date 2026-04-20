@@ -3,12 +3,14 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::Client;
+use serde_json::{Value, json};
 use tokio_stream::Stream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{Settings, get_provider_api_key, get_provider_base_url};
 use crate::converter::{build_openai_request, map_stop_reason};
+use crate::heuristic_tool_parser::HeuristicToolParser;
 use crate::ip_rotator;
 use crate::models::anthropic::MessagesRequest;
 use crate::models::openai::ChatCompletionChunk;
@@ -146,7 +148,13 @@ impl OpenAICompatProvider {
                         if status >= 400 {
                             let body_text = response.text().await.unwrap_or_default();
                             error!("Provider error {}: {}", status, body_text);
-                            last_error = Some(format!("Provider returned status {}", status));
+
+                            // Extract readable error message from provider response
+                            let provider_msg = extract_provider_error(&body_text);
+                            last_error = Some(format!(
+                                "Provider returned status {} (request_id={}): {}",
+                                status, request_id, provider_msg
+                            ));
 
                             if status >= 500 && attempt < max_retries {
                                 let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
@@ -156,7 +164,9 @@ impl OpenAICompatProvider {
                             break;
                         }
 
+                        // --- Successful response: process stream ---
                         let mut think_parser = ThinkTagParser::new();
+                        let mut heuristic_parser = HeuristicToolParser::new();
                         let mut finish_reason: Option<String> = None;
                         let mut usage_output_tokens: Option<u32> = None;
                         let mut byte_stream = response.bytes_stream();
@@ -189,7 +199,10 @@ impl OpenAICompatProvider {
 
                                 let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
                                     Ok(c) => c,
-                                    Err(_) => continue,
+                                    Err(e) => {
+                                        debug!("Skipping unparseable chunk: {} ({})", data, e);
+                                        continue;
+                                    }
                                 };
 
                                 if let Some(ref usage) = chunk.usage
@@ -208,6 +221,7 @@ impl OpenAICompatProvider {
                                 }
 
                                 if let Some(ref delta) = choice.delta {
+                                    // Handle native reasoning_content (DeepSeek, etc.)
                                     if let Some(ref reasoning) = delta.reasoning_content {
                                         for event in sse.ensure_thinking_block() {
                                             yield event;
@@ -215,9 +229,10 @@ impl OpenAICompatProvider {
                                         yield sse.emit_thinking_delta(reasoning);
                                     }
 
+                                    // Handle text content with think-tag and heuristic tool parsing
                                     if let Some(ref content) = delta.content {
-                                        let chunks = think_parser.feed(content);
-                                        for c in chunks {
+                                        let think_chunks = think_parser.feed(content);
+                                        for c in think_chunks {
                                             match c.content_type {
                                                 ContentType::Thinking => {
                                                     for event in sse.ensure_thinking_block() {
@@ -226,15 +241,51 @@ impl OpenAICompatProvider {
                                                     yield sse.emit_thinking_delta(&c.content);
                                                 }
                                                 ContentType::Text => {
-                                                    for event in sse.ensure_text_block() {
-                                                        yield event;
+                                                    // Run heuristic tool parser on text content
+                                                    let (filtered_text, detected_tools) =
+                                                        heuristic_parser.feed(&c.content);
+
+                                                    if !filtered_text.is_empty() {
+                                                        for event in sse.ensure_text_block() {
+                                                            yield event;
+                                                        }
+                                                        yield sse.emit_text_delta(&filtered_text);
                                                     }
-                                                    yield sse.emit_text_delta(&c.content);
+
+                                                    // Emit detected heuristic tool calls
+                                                    for tool_use in &detected_tools {
+                                                        for event in sse.close_content_blocks() {
+                                                            yield event;
+                                                        }
+                                                        let block_idx = sse.blocks.allocate_index();
+                                                        let mut input = tool_use.input.clone();
+                                                        // Force Task subagent to foreground
+                                                        if tool_use.name == "Task" {
+                                                            input.insert(
+                                                                "run_in_background".to_string(),
+                                                                "false".to_string(),
+                                                            );
+                                                        }
+                                                        let input_json = serde_json::to_string(&input)
+                                                            .unwrap_or_else(|_| "{}".to_string());
+                                                        yield sse.content_block_start(
+                                                            block_idx,
+                                                            "tool_use",
+                                                            json!({"id": tool_use.id, "name": tool_use.name}),
+                                                        );
+                                                        yield sse.content_block_delta(
+                                                            block_idx,
+                                                            "input_json_delta",
+                                                            &input_json,
+                                                        );
+                                                        yield sse.content_block_stop(block_idx);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
 
+                                    // Handle native tool calls from provider
                                     if let Some(ref tool_calls) = delta.tool_calls {
                                         for event in sse.close_content_blocks() {
                                             yield event;
@@ -256,13 +307,57 @@ impl OpenAICompatProvider {
                                                 let name = sse.blocks.tool_states.get(&tc_index)
                                                     .map(|s| s.name.clone())
                                                     .unwrap_or_default();
+
+                                                // If we have args but no name yet, defer starting
+                                                if name.is_empty() && tc.id.is_none() 
+                                                    && let Some(ref func) = tc.function
+                                                    && func.arguments.as_ref().is_some_and(|a| !a.is_empty())
+                                                {
+                                                    // Buffer args; don't start block until we have a name
+                                                    if let Some(ref args) = func.arguments {
+                                                        sse.blocks.register_tool_name(tc_index, "");
+                                                        if let Some(state) = sse.blocks.tool_states.get_mut(&tc_index) {
+                                                            state.contents.push(args.clone());
+                                                        }
+                                                    }
+                                                    continue;
+                                                }
+
                                                 yield sse.start_tool_block(tc_index, &tool_id, &name);
                                             }
 
                                             if let Some(ref func) = tc.function
                                                 && let Some(ref args) = func.arguments
                                                     && !args.is_empty() {
-                                                        yield sse.emit_tool_delta(tc_index, args);
+                                                        // Buffer Task tool args to force run_in_background: false
+                                                        let current_name = sse.blocks.tool_states
+                                                            .get(&tc_index)
+                                                            .map(|s| s.name.as_str())
+                                                            .unwrap_or("");
+
+                                                        if current_name == "Task" {
+                                                            let state = sse.blocks.tool_states.get_mut(&tc_index);
+                                                            if let Some(state) = state {
+                                                                state.contents.push(args.clone());
+                                                                // Try parsing the accumulated JSON
+                                                                let accumulated: String = state.contents.iter().cloned().collect();
+                                                                if let Ok(mut parsed) = serde_json::from_str::<Value>(&accumulated) {
+                                                                    if let Some(obj) = parsed.as_object_mut() {
+                                                                        obj.insert("run_in_background".to_string(), json!(false));
+                                                                    }
+                                                                    let patched = serde_json::to_string(&parsed).unwrap_or_default();
+                                                                    // Emit the full patched JSON as a single delta
+                                                                    let block_idx = state.block_index;
+                                                                    yield sse.content_block_delta(
+                                                                        block_idx as u32,
+                                                                        "input_json_delta",
+                                                                        &patched,
+                                                                    );
+                                                                }
+                                                            }
+                                                        } else {
+                                                            yield sse.emit_tool_delta(tc_index, args);
+                                                        }
                                                     }
                                         }
                                     }
@@ -274,6 +369,7 @@ impl OpenAICompatProvider {
                             break;
                         }
 
+                        // Flush think parser
                         if let Some(remaining) = think_parser.flush() {
                             match remaining.content_type {
                                 ContentType::Thinking => {
@@ -289,6 +385,31 @@ impl OpenAICompatProvider {
                                     yield sse.emit_text_delta(&remaining.content);
                                 }
                             }
+                        }
+
+                        // Flush heuristic tool parser
+                        for tool_use in heuristic_parser.flush() {
+                            for event in sse.close_content_blocks() {
+                                yield event;
+                            }
+                            let block_idx = sse.blocks.allocate_index();
+                            let mut input = tool_use.input.clone();
+                            if tool_use.name == "Task" {
+                                input.insert("run_in_background".to_string(), "false".to_string());
+                            }
+                            let input_json = serde_json::to_string(&input)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            yield sse.content_block_start(
+                                block_idx,
+                                "tool_use",
+                                json!({"id": tool_use.id, "name": tool_use.name}),
+                            );
+                            yield sse.content_block_delta(
+                                block_idx,
+                                "input_json_delta",
+                                &input_json,
+                            );
+                            yield sse.content_block_stop(block_idx);
                         }
 
                         if !sse.has_any_content() {
@@ -311,11 +432,12 @@ impl OpenAICompatProvider {
                 }
             }
 
+            // Error path: emit error to Claude Code
             let error_msg = last_error.unwrap_or_else(|| "Unknown error".to_string());
             for event in sse.close_content_blocks() {
                 yield event;
             }
-            for event in sse.emit_error(&format!("Error: {} (request_id={})", error_msg, request_id)) {
+            for event in sse.emit_error(&format!("Error: {}", error_msg)) {
                 yield event;
             }
             for event in sse.close_all_blocks() {
@@ -324,6 +446,43 @@ impl OpenAICompatProvider {
             yield sse.message_delta("end_turn", 0);
             yield sse.message_stop();
         }
+    }
+}
+
+/// Extract a human-readable error message from the provider's JSON error body.
+fn extract_provider_error(body: &str) -> String {
+    // Try parsing as JSON to extract the message
+    if let Ok(val) = serde_json::from_str::<Value>(body) {
+        // Standard: {"error": {"message": "..."}}
+        if let Some(msg) = val
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return msg.to_string();
+        }
+        // Array: [{"error": {"message": "..."}}]
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(msg) = item
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    return msg.to_string();
+                }
+            }
+        }
+        // Fallback: {"message": "..."}
+        if let Some(msg) = val.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+    }
+    // Not JSON, return truncated raw body
+    if body.len() > 200 {
+        format!("{}...", &body[..200])
+    } else {
+        body.to_string()
     }
 }
 

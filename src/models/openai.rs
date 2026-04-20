@@ -18,6 +18,8 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<ChatTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

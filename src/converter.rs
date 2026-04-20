@@ -1,5 +1,6 @@
 use crate::models::anthropic::*;
 use crate::models::openai::*;
+use serde_json::Value;
 
 pub fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
     let mut result = Vec::new();
@@ -167,18 +168,24 @@ pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
     tools
         .iter()
         .map(|t| {
-            let mut parameters = Some(t.input_schema.clone());
-
-            if let Some(obj) = t.input_schema.as_object() {
+            // Always provide a valid JSON schema structure.
+            // Providers like Gemini reject null/missing parameters.
+            let parameters = if t.input_schema.is_object() {
+                let obj = t.input_schema.as_object().unwrap();
                 if obj.is_empty() {
-                    parameters = None;
-                } else if let Some(props) = obj.get("properties")
-                    && props.as_object().is_some_and(|o| o.is_empty())
-                    && obj.get("required").is_none()
-                {
-                    parameters = None;
+                    // Empty object → minimal valid schema
+                    Some(serde_json::json!({"type": "object", "properties": {}}))
+                } else {
+                    // Ensure "type": "object" is present
+                    let mut schema = t.input_schema.clone();
+                    if schema.get("type").is_none() {
+                        schema["type"] = serde_json::json!("object");
+                    }
+                    Some(schema)
                 }
-            }
+            } else {
+                Some(serde_json::json!({"type": "object", "properties": {}}))
+            };
 
             ChatTool {
                 tool_type: "function".to_string(),
@@ -192,6 +199,42 @@ pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
         .collect()
 }
 
+/// Convert Anthropic tool_choice to OpenAI-compatible format.
+///
+/// Anthropic sends: `{"type": "auto"}`, `{"type": "any"}`, `{"type": "tool", "name": "X"}`
+/// OpenAI expects: `"auto"`, `"required"`, `{"type": "function", "function": {"name": "X"}}`
+pub fn convert_tool_choice(tool_choice: &Option<Value>) -> Option<Value> {
+    match tool_choice {
+        None => None,
+        Some(val) => {
+            // Already a string ("auto", "required", "none") → pass through
+            if val.is_string() {
+                return Some(val.clone());
+            }
+            // Object with "type" field → convert
+            if let Some(obj) = val.as_object() {
+                match obj.get("type").and_then(|v| v.as_str()) {
+                    Some("auto") => Some(serde_json::json!("auto")),
+                    Some("any") => Some(serde_json::json!("required")),
+                    Some("tool") => {
+                        let name = obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        Some(serde_json::json!({
+                            "type": "function",
+                            "function": {"name": name}
+                        }))
+                    }
+                    _ => Some(val.clone()),
+                }
+            } else {
+                Some(val.clone())
+            }
+        }
+    }
+}
+
 pub fn build_openai_request(request: &MessagesRequest, model_name: &str) -> ChatCompletionRequest {
     let mut messages = Vec::new();
     if let Some(sys) = convert_system_prompt(&request.system) {
@@ -200,6 +243,7 @@ pub fn build_openai_request(request: &MessagesRequest, model_name: &str) -> Chat
     messages.extend(convert_messages(&request.messages));
 
     let tools = request.tools.as_ref().map(|t| convert_tools(t));
+    let tool_choice = convert_tool_choice(&request.tool_choice);
 
     ChatCompletionRequest {
         model: model_name.to_string(),
@@ -210,7 +254,8 @@ pub fn build_openai_request(request: &MessagesRequest, model_name: &str) -> Chat
         top_p: request.top_p,
         stop: request.stop_sequences.clone(),
         tools,
-        tool_choice: request.tool_choice.clone(),
+        tool_choice,
+        stream_options: Some(serde_json::json!({"include_usage": true})),
     }
 }
 
