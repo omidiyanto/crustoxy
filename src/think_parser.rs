@@ -47,34 +47,34 @@ impl ThinkTagParser {
     fn parse_outside(&mut self) -> Option<ContentChunk> {
         let mut best_open: Option<(&'static str, &'static str, usize)> = None;
         for &(open, close) in TAG_PAIRS {
-            if let Some(pos) = self.buffer.find(open) {
-                if best_open.is_none() || pos < best_open.unwrap().2 {
-                    best_open = Some((open, close, pos));
-                }
+            if let Some(pos) = self.buffer.find(open)
+                && (best_open.is_none() || pos < best_open.unwrap().2)
+            {
+                best_open = Some((open, close, pos));
             }
         }
 
         let mut best_close: Option<(usize, usize)> = None; // (pos, len)
         for &(_, close) in TAG_PAIRS {
-            if let Some(pos) = self.buffer.find(close) {
-                if best_close.is_none() || pos < best_close.unwrap().0 {
-                    best_close = Some((pos, close.len()));
-                }
+            if let Some(pos) = self.buffer.find(close)
+                && (best_close.is_none() || pos < best_close.unwrap().0)
+            {
+                best_close = Some((pos, close.len()));
             }
         }
 
-        if let Some((oc_pos, oc_len)) = best_close {
-            if best_open.is_none() || oc_pos < best_open.unwrap().2 {
-                let pre = self.buffer[..oc_pos].to_string();
-                self.buffer = self.buffer[oc_pos + oc_len..].to_string();
-                if !pre.is_empty() {
-                    return Some(ContentChunk {
-                        content_type: ContentType::Text,
-                        content: pre,
-                    });
-                }
-                return None;
+        if let Some((oc_pos, oc_len)) = best_close
+            && (best_open.is_none() || oc_pos < best_open.unwrap().2)
+        {
+            let pre = self.buffer[..oc_pos].to_string();
+            self.buffer = self.buffer[oc_pos + oc_len..].to_string();
+            if !pre.is_empty() {
+                return Some(ContentChunk {
+                    content_type: ContentType::Text,
+                    content: pre,
+                });
             }
+            return None;
         }
 
         match best_open {
