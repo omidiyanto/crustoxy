@@ -96,7 +96,7 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
 4. **Connect Claude Code**
    Set the API URL for your local Claude Code terminal session:
    ```bash
-   export ANTHROPIC_API_KEY="sk-ant-dummy"
+   export ANTHROPIC_AUTH_TOKEN="sk-ant-dummy"
    export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
    claude
    ```
