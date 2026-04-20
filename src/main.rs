@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod converter;
+mod heuristic_tool_parser;
 mod ip_rotator;
 mod models;
 mod optimization;
