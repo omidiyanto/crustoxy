@@ -167,6 +167,7 @@ impl OpenAICompatProvider {
                                 Ok(b) => b,
                                 Err(e) => {
                                     error!("Stream read error: {}", e);
+                                    last_error = Some(format!("error decoding response body: {}", e));
                                     break;
                                 }
                             };
@@ -267,6 +268,10 @@ impl OpenAICompatProvider {
                                     }
                                 }
                             }
+                        }
+
+                        if last_error.is_some() {
+                            break;
                         }
 
                         if let Some(remaining) = think_parser.flush() {
