@@ -57,7 +57,8 @@ pub struct ChatTool {
 pub struct ChatToolFunction {
     pub name: String,
     pub description: String,
-    pub parameters: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

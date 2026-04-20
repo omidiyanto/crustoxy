@@ -166,13 +166,27 @@ pub fn convert_system_prompt(system: &Option<SystemPrompt>) -> Option<ChatMessag
 pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
     tools
         .iter()
-        .map(|t| ChatTool {
-            tool_type: "function".to_string(),
-            function: ChatToolFunction {
-                name: t.name.clone(),
-                description: t.description.clone().unwrap_or_default(),
-                parameters: t.input_schema.clone(),
-            },
+        .map(|t| {
+            let mut parameters = Some(t.input_schema.clone());
+            
+            if let Some(obj) = t.input_schema.as_object() {
+                if obj.is_empty() {
+                    parameters = None;
+                } else if let Some(props) = obj.get("properties") {
+                    if props.as_object().is_some_and(|o| o.is_empty()) && obj.get("required").is_none() {
+                        parameters = None;
+                    }
+                }
+            }
+
+            ChatTool {
+                tool_type: "function".to_string(),
+                function: ChatToolFunction {
+                    name: t.name.clone(),
+                    description: t.description.clone().unwrap_or_default(),
+                    parameters,
+                },
+            }
         })
         .collect()
 }
