@@ -18,5 +18,3 @@ services:
       - /dev/net/tun:/dev/net/tun
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
-    environment:
-      - ENABLE_IP_ROTATION=true
