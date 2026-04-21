@@ -186,24 +186,24 @@ impl HeuristicToolParser {
     }
 }
 
-// ═══ TAMBAHAN: GARBLED JSON RECOVERY (FALLBACK) ═══
+// ═══ FALLBACK: GARBLED JSON RECOVERY ═══
 
 static RE_TOOL_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""name"\s*:\s*"([^"]+)""#).unwrap());
 
-/// Pattern A: "parameter=key>value" (Sering terjadi pada Llama/Qwen)
+/// Pattern A: "parameter=key>value" (Often happens on Llama/Qwen)
 static RE_PATTERN_A: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"["\s,]?parameter=(\w+)>\s*(.*?)(?:</parameter>|$)"#).unwrap());
 
-/// Pattern B: "<parameter_key>value" atau "<parameter=key>value"
+/// Pattern B: "<parameter_key>value" or "<parameter=key>value"
 static RE_PATTERN_B: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"<parameter[_=](\w+)>\s*(.*?)(?:</parameter|<|$)"#).unwrap());
 
-/// Pattern C: JSON "arguments" malformed (hilang kurung tutup)
+/// Pattern C: JSON "arguments" malformed (missing closing bracket)
 static RE_PATTERN_C_ARGS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""arguments"\s*:\s*\{(.*)"#).unwrap());
 
-/// Pattern C lanjutan: Ekstrak key-value dari arguments
+/// Pattern C continued: Extract key-value pairs from arguments
 static RE_PATTERN_C_KV: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)""#).unwrap());
 
@@ -214,10 +214,10 @@ pub struct RecoveredToolCall {
     pub arguments: Map<String, Value>,
 }
 
-/// Fallback: Mencoba merekonstruksi tool call dari JSON yang hancur.
-/// Hanya dipanggil jika `serde_json::from_str` gagal.
+/// Fallback: Attempts to reconstruct tool call from garbled JSON.
+/// Only called when `serde_json::from_str` fails.
 pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
-    // 1. Ekstrak nama tool (Wajib ada)
+    // 1. Extract tool name (Required)
     let name = RE_TOOL_NAME
         .captures(content)
         .and_then(|caps| caps.get(1))
@@ -225,7 +225,7 @@ pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
 
     let mut arguments = Map::new();
 
-    // 2. Coba Pattern A: "parameter=key>value"
+    // 2. Try Pattern A: "parameter=key>value"
     for caps in RE_PATTERN_A.captures_iter(content) {
         if let (Some(k), Some(v)) = (caps.get(1), caps.get(2)) {
             arguments.insert(
@@ -241,7 +241,7 @@ pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
         }
     }
 
-    // 3. Coba Pattern B jika A kosong: "<parameter_key>value"
+    // 3. Try Pattern B if A is empty: "<parameter_key>value"
     if arguments.is_empty() {
         for caps in RE_PATTERN_B.captures_iter(content) {
             if let (Some(k), Some(v)) = (caps.get(1), caps.get(2)) {
@@ -259,7 +259,7 @@ pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
         }
     }
 
-    // 4. Coba Pattern C jika B kosong: Malformed JSON arguments
+    // 4. Try Pattern C if B is empty: Malformed JSON arguments
     if arguments.is_empty()
         && let Some(args_match) = RE_PATTERN_C_ARGS.captures(content)
     {
@@ -274,7 +274,7 @@ pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
         }
     }
 
-    // 5. Coba Pattern D jika C kosong: Single-argument inference
+    // 5. Try Pattern D if C is empty: Single-argument inference
     if arguments.is_empty() {
         let single_arg_tools = [
             ("Bash", "command"),
@@ -285,11 +285,11 @@ pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
         ];
 
         if let Some(&(_, param_key)) = single_arg_tools.iter().find(|(t, _)| *t == name) {
-            // Ambil semua sisa teks setelah deklarasi nama
+            // Get all remaining text after the name declaration
             if let Some(name_match) = RE_TOOL_NAME.find(content) {
                 let after_name = &content[name_match.end()..];
 
-                // Bersihkan karakter JSON noise ( { } " , : dsb) dan tag parameter
+                // Clean up JSON noise characters ( { } " , : etc.) and parameter tags
                 let cleaned = after_name
                     .trim_start_matches(|c: char| {
                         c.is_whitespace() || c == ',' || c == '"' || c == ':' || c == '{'
