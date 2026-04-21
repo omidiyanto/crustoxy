@@ -1,4 +1,4 @@
-# 🦀 Crustoxy - Proxy Router for Claude Code built in Rust
+<h1 align="center">🦀 Crustoxy - Proxy Router for Claude Code built in Rust</h1>
 
 <div align="center">
     <a href="https://sonarcloud.io/summary/new_code?id=omidiyanto_crustoxy">
@@ -20,7 +20,7 @@
 <br>
 
 <div align="center">
-<pre>
+<pre style="color: #E57324; background: transparent; border: 2px dashed #E57324; padding: 16px; border-radius: 10px; display: inline-block;">
  ██████╗██████╗ ██╗   ██╗███████╗████████╗ ██████╗ ██╗  ██╗██╗   ██╗
 ██╔════╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
 ██║     ██████╔╝██║   ██║███████╗   ██║   ██║   ██║ ╚███╔╝  ╚████╔╝ 
@@ -28,30 +28,30 @@
 ╚██████╗██║  ██║╚██████╔╝███████║   ██║   ╚██████╔╝██╔╝ ██╗   ██║   
  ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝   ╚═╝   
 </pre>
+
+<h3 align="center"><i>A highly optimized, fast, and secure single-binary web server written in Rust <br> that acts as a proxy router for <a href="https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview">Claude Code</a>.</i></h3>
 </div>
 
-A highly optimized, fast, and secure single-binary web server written in Rust that acts as a proxy router for [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview).  
-
-## **Why was Crustoxy created?**  
+## **🤔 Why was Crustoxy created?**  
 This project was built to unleash the extraordinary potential of *Claude Code*. Claude Code transcends traditional CLI coding agents due to its software architecture, which is designed as an enterprise-grade autonomous agent ecosystem rather than a simple terminal interface wrapper. Its core strength lies in agentic workflows that embed seamlessly into your local environment—capable of autonomously mapping repositories, executing terminal commands, running comprehensive test suites, and performing self-healing on errors. These functions are entirely driven by a proprietary system prompt meticulously crafted for context management optimization without demanding manual configuration.
 
 Furthermore, this tool is fortified by a robust plugin ecosystem enabling smooth integration with various third-party services. It comes wrapped in enterprise-grade security and governance features such as anti-destructive guardrails, strict access management, and high-level privacy standards. This makes it an instant, secure, and infinitely more comprehensive plug-and-play solution for industrial scale when compared to rigid open-source alternatives.
 
 Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely interact with 24+ different LLM providers (such as OpenAI, OpenRouter, Groq, DeepSeek, Google Gemini, Ollama, etc.), liberating it from the exclusivity constraints of the Anthropic API.
 
-## Core Features
+## 🎯 Core Features
 
-- **Blazing Fast**: Written in pure Rust using `axum`, boasting near-zero latency and a minimal memory footprint.
-- **Anthropic ↔ OpenAI Compat API**: Automatically converts Anthropic's complex API requests (`messages`, `system`, `tools`, `thinking`) into standard OpenAI-compatible API requests, and seamlessly streams responses back using Anthropic's SSE (Server-Sent Events) formatting.
-- **24+ Built-in Providers**: Natively integrates with 24 major platforms by automatically defining base URLs, mapped directly out of your `.env` configuration.
-- **Smart 429 Rate Limit Handling**:
-  - Proactive sliding window rate limiter to throttle requests *before* limits are exceeded.
-  - Reactive blocking with exponential backoff + jitter retries upon HTTP `429`s.
-- **Automated IP Rotation**: Automatically executes `warp-cli` sequences to rotate your public Cloudflare WARP IP if all rate-limit retries fail.
-- **Zero-Latency Optimizations**: Intercepts internal Claude Code metadata calls (like Quota probing, conversation title generation, and filepath extraction) and mocks responses instantly, bypassing expensive provider API roundtrips.
-- **Advanced Think Tag Parsing**: Processes inline `<think>...</think>` tags on-the-fly and safely translates them into pure Anthropic `thinking` blocks during the SSE stream.
-- **Heuristic Tool Parsing**: Dynamically detects raw text tool calls (e.g., `<function=Name>...`) emitted by open-source models as a fallback, converting them into valid Anthropic structured tool calls.
-- **VS Code Extension Compatibility**: Fully compatible with the official Claude Code for VS Code extension.
+- **Blazing Fast & Lightweight**: Written in pure Rust using `axum`, boasting near-zero proxy latency and an extremely minimal memory footprint perfect for long-running daemonized processes.
+- **Anthropic ↔ OpenAI Compat API**: Automatically translates Anthropic's complex proprietary API requests (such as `messages`, `system`, `tools`, `thinking`) into standard, universally accepted OpenAI-compatible API requests. It then seamlessly streams the responses back using Anthropic's exact SSE (Server-Sent Events) formatting and event sequences.
+- **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, driven directly by your simple `.env` configuration.
+- **Smart 429 Rate Limit Deflection**:
+  - Proactive algorithmic sliding window rate limiter that intelligently throttles concurrent bursts *before* provider limits are hit.
+  - Reactive blocking with customizable exponential backoff and jitter retries when an HTTP `429` is eventually encountered.
+- **Automated IP Rotation (Anti-WAF Shield)**: Actively communicates with a localized `warp-svc` daemon to automatically trigger `warp-cli` disconnection and registration renewal sequences, rotating your public Cloudflare WARP IPv4/IPv6 if all passive rate-limit retries fail to bypass IP-based blocks.
+- **Zero-Latency Agentic Mocking**: Intercepts expensive internal Claude Code workspace telemetry calls (such as Quota probing, conversation title generation, and OS filepath constraint extraction) and mocks the responses instantly on the edge, bypassing wasteful API roundtrips and heavily saving token costs.
+- **Advanced Think & Thought Tag Extraction**: Stateful stream parsing that intercepts inline deep-reasoning tags (`<think>...` or `<thought>...`) emitted by Open-Weights models on-the-fly, safely relocating their contents into pure, native Anthropic `thinking` blocks without interrupting the main text stream.
+- **Heuristic Tool Parser Fallback**: Dynamically detects raw, hallucinated text tool calls (e.g., `<function=Name><parameter=key>value</parameter>`) occasionally emitted by less capable open-source models as a fallback, parsing their geometry and accurately converting them into valid Anthropic structured JSON tool call events.
+- **IDE Extension Compatibility**: Plug-and-play compatibility with both the official `Claude Code for VS Code` extension as well as the robust `Google Antigravity` IDE assistant workflow.
 
 ---
 
@@ -112,15 +112,24 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
    ```
 
 5. **Connect via Claude Code VS Code Extension**
-   Crustoxy is fully compatible with the official Claude Code VS Code extension. To configure it:
-   1. Open VS Code Settings (`Ctrl + ,` or `Cmd + ,` on Mac).
-   2. Search for `@ext:anthropic.claude-code env`.
-   3. Under **Claude Code > Environment Variables**:
-      - Click **Add Item**.
-      - Set Item to `ANTHROPIC_BASE_URL` and Value to `http://127.0.0.1:8082`
-      - Click **Add Item** again.
-      - Set Item to `ANTHROPIC_AUTH_TOKEN` and Value to `sk-ant-dummy`
-   4. Reload the extension or restart VS Code for the environment variables to take effect.
+   Crustoxy is fully compatible with the official Claude Code VS Code extension. To configure it via the raw settings file:
+   1. Open the Extensions tab in VS Code and search for **Claude Code for VS Code**.
+   2. Click the gear (`⚙️`) icon on the extension page and select **Extension Settings**.
+   3. Find **Claude Code: Environment Variables** and click the hyperlink **"Edit in settings.json"**.
+   4. Map your proxy values by inserting the JSON array like this example:
+      ```json
+      "claudeCode.environmentVariables": [
+          {
+              "name": "ANTHROPIC_BASE_URL",
+              "value": "http://127.0.0.1:8082"
+          },
+          {
+              "name": "ANTHROPIC_AUTH_TOKEN",
+              "value": "sk-ant-dummy"
+          }
+      ]
+      ```
+   5. Save the file and restart your IDE for the connection to apply.
 
 ---
 
@@ -163,7 +172,7 @@ No need to figure out endpoint definitions. Just pop in your `API_KEY` for any o
 
 ---
 
-## WARP IP Rotation Mode
+## 🔄 WARP IP Rotation Mode
 
 When `ENABLE_IP_ROTATION=true` in `.env`, the router will actively communicate with a local Cloudflare WARP daemon. 
 If an API provider throws a `429 Too Many Requests` error and all internal exponential retries fail, it triggers a thread-safe native sequence to:
