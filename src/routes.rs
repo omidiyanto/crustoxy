@@ -65,6 +65,26 @@ pub async fn create_message(
     let request_id = format!("req_{}", &Uuid::new_v4().to_string()[..12]);
     let input_tokens = count_request_tokens(&request);
 
+    // Non-streaming path (fallback — only when client explicitly sets stream: false)
+    if request.stream == Some(false) {
+        let result = state
+            .provider
+            .send_non_streaming(&request, input_tokens, &request_id)
+            .await;
+        return match result {
+            Ok(response_json) => Json(response_json).into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": e}
+                })),
+            )
+                .into_response(),
+        };
+    }
+
+    // Default: SSE streaming path (existing behavior, unchanged)
     let stream = state
         .provider
         .stream_response(&request, input_tokens, &request_id);
@@ -113,8 +133,18 @@ pub async fn count_tokens(
     Json(json!({"input_tokens": tokens})).into_response()
 }
 
-pub async fn health() -> Json<serde_json::Value> {
-    Json(json!({"status": "healthy"}))
+pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let provider_type = Settings::parse_provider_type(&state.settings.model);
+    Json(json!({
+        "status": "healthy",
+        "model": state.settings.model,
+        "provider": provider_type,
+        "version": env!("CARGO_PKG_VERSION"),
+        "features": {
+            "ip_rotation": state.settings.enable_ip_rotation,
+            "tool_retry": state.settings.enable_tool_retry,
+        }
+    }))
 }
 
 pub async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {

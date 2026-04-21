@@ -10,6 +10,7 @@ mod rate_limiter;
 mod routes;
 mod sse;
 mod think_parser;
+mod tool_intent_detector;
 
 use std::sync::Arc;
 
