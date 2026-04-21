@@ -158,6 +158,8 @@ pub struct Settings {
     pub enable_suggestion_mode_skip: bool,
     pub fast_prefix_detection: bool,
     pub enable_filepath_extraction_mock: bool,
+    pub enable_tool_retry: bool,
+    pub tool_retry_max: u32,
 }
 
 impl Settings {
@@ -191,6 +193,8 @@ impl Settings {
             enable_filepath_extraction_mock: env_or("ENABLE_FILEPATH_EXTRACTION_MOCK", "true")
                 .parse()
                 .unwrap_or(true),
+            enable_tool_retry: env_or("ENABLE_TOOL_RETRY", "true").parse().unwrap_or(true),
+            tool_retry_max: env_or("TOOL_RETRY_MAX", "2").parse().unwrap_or(2),
         }
     }
 

@@ -42,7 +42,9 @@ Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely in
 - **Automated IP Rotation (Anti-WAF Shield)**: Actively communicates with a localized `warp-svc` daemon to automatically trigger `warp-cli` disconnection and registration renewal sequences, rotating your public Cloudflare WARP IPv4/IPv6 if all passive rate-limit retries fail to bypass IP-based blocks.
 - **Zero-Latency Agentic Mocking**: Intercepts expensive internal Claude Code workspace telemetry calls (such as Quota probing, conversation title generation, and OS filepath constraint extraction) and mocks the responses instantly on the edge, bypassing wasteful API roundtrips and heavily saving token costs.
 - **Advanced Think & Thought Tag Extraction**: Stateful stream parsing that intercepts inline deep-reasoning tags (`<think>...` or `<thought>...`) emitted by Open-Weights models on-the-fly, safely relocating their contents into pure, native Anthropic `thinking` blocks without interrupting the main text stream.
-- **Heuristic Tool Parser Fallback**: Dynamically detects raw, hallucinated text tool calls (e.g., `<function=Name><parameter=key>value</parameter>`) occasionally emitted by less capable open-source models as a fallback, parsing their geometry and accurately converting them into valid Anthropic structured JSON tool call events.
+- **Heuristic Tool Parser Fallback**: A two-tiered safety net that statically heals structurally malformed/garbled JSON tool schemas, and dynamically detects raw text tool calls (e.g., `<function=Name><parameter=key>value</parameter>`) natively emitted by Open-Weights models. It parses their geometry on-the-fly and accurately converts them into valid Anthropic structured JSON tool call events.
+- **Intelligent Auto-Retry Pipeline**: A self-healing SSE streaming architecture that detects tool-calling intent in plain text responses and automatically triggers an internal corrective retry, keeping the connection open and preventing Claude Code from stalling.
+- **Synchronous Non-Streaming Fallback**: Graceful handling of standard `stream: false` requests, securely decoding raw text/tool calls back into Anthropic `MessagesResponse` format.
 - **IDE Extension Compatibility**: Plug-and-play compatibility with both the official `Claude Code for VS Code` extension as well as the robust `Google Antigravity` IDE assistant workflow.
 
 ---
@@ -137,6 +139,40 @@ docker-compose up -d --build
 # View logs
 docker-compose logs -f
 ```
+
+---
+
+## ⚙️ Configuration Parameters
+
+You can fine-tune Crustoxy to fit your exact infrastructure requirements via the `.env` file. Below are the configurations and what they govern:
+
+### 1. Server Configuration
+- `HOST` *(default: `0.0.0.0`)*: The network interface the proxy runs on.
+- `PORT` *(default: `8082`)*: The port the proxy listens on.
+- `ANTHROPIC_AUTH_TOKEN`: Optional. Defines an arbitrary static Bearer token used to secure Crustoxy. If filled, Claude Code CLI must use the matching value in its `ANTHROPIC_AUTH_TOKEN` environment variable. Leave blank for no auth.
+
+### 2. Model Mapping
+Claude Code inherently delegates tasks between `opus`, `sonnet`, and `haiku` models implicitly. Crustoxy redirects these to the models of your choosing:
+- `MODEL_OPUS` / `MODEL_SONNET` / `MODEL_HAIKU`: Format using `provider_id/model_id` (e.g., `groq/llama3-8b-8192`).
+- `MODEL`: The fallback unified model router if a specific subset isn't defined.
+
+### 3. Rate Limiting & Concurrency
+Crustoxy employs algorithmic Sliding Window limits to prevent your account from hitting provider throttles too aggressively.
+- `PROVIDER_RATE_LIMIT` *(default: `40`)*: The amount of requests allowed during the window.
+- `PROVIDER_RATE_WINDOW` *(default: `60`)*: The timeframe in seconds where the rate limit applies.
+- `PROVIDER_MAX_CONCURRENCY` *(default: `5`)*: Hard caps how many simultaneous HTTP requests can be inflight to the provider. Any excess requests will cleanly wait in queue.
+
+### 4. HTTP Settings
+- `HTTP_READ_TIMEOUT` *(default: `300`)*: Max time in seconds to keep a stream connection alive while waiting for inference tokens. High values are recommended for deep reasoning models.
+- `HTTP_CONNECT_TIMEOUT` *(default: `10`)*: Max time in seconds allowed to establish the initial HTTP handshake with a provider.
+
+### 5. IP Rotation
+- `ENABLE_IP_ROTATION` *(default: `true`)*: If set to true, seamlessly communicates with `warp-cli` to switch IP allocations when a provider enforces persistent IP-based `429` blocks. (Requires Cloudflare WARP daemon).
+
+### 6. Optimizations & Safety Nets
+- `ENABLE_NETWORK_PROBE_MOCK` / `ENABLE_TITLE_GENERATION_SKIP` / `ENABLE_SUGGESTION_MODE_SKIP` / `ENABLE_FILEPATH_EXTRACTION_MOCK`: Set to `true` to intercept internal telemetry and UI-aesthetic requests heavily spammed by Claude Code. Crustoxy mocks perfect responses instantly, slashing your API token costs heavily.
+- `ENABLE_TOOL_RETRY` *(default: `true`)*: Activates the active Auto-Retry Pipeline. When set to true, if a model writes sentences indicating it wants to use a tool (e.g. "Let me run a command") but fails to actually output the structured tool JSON, Crustoxy will silently push the context back and force the model to retry.
+- `TOOL_RETRY_MAX` *(default: `2`)*: The maximum amount of times Crustoxy is allowed to automatically retry the provider per single user prompt.
 
 ---
 

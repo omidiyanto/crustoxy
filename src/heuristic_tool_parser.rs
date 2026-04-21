@@ -1,4 +1,5 @@
 use regex::Regex;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -183,4 +184,134 @@ impl HeuristicToolParser {
 
         detected
     }
+}
+
+// ═══ FALLBACK: GARBLED JSON RECOVERY ═══
+
+static RE_TOOL_NAME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""name"\s*:\s*"([^"]+)""#).unwrap());
+
+/// Pattern A: "parameter=key>value" (Often happens on Llama/Qwen)
+static RE_PATTERN_A: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"["\s,]?parameter=(\w+)>\s*(.*?)(?:</parameter>|$)"#).unwrap());
+
+/// Pattern B: "<parameter_key>value" or "<parameter=key>value"
+static RE_PATTERN_B: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"<parameter[_=](\w+)>\s*(.*?)(?:</parameter|<|$)"#).unwrap());
+
+/// Pattern C: JSON "arguments" malformed (missing closing bracket)
+static RE_PATTERN_C_ARGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""arguments"\s*:\s*\{(.*)"#).unwrap());
+
+/// Pattern C continued: Extract key-value pairs from arguments
+static RE_PATTERN_C_KV: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)""#).unwrap());
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RecoveredToolCall {
+    pub name: String,
+    pub arguments: Map<String, Value>,
+}
+
+/// Fallback: Attempts to reconstruct tool call from garbled JSON.
+/// Only called when `serde_json::from_str` fails.
+pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
+    // 1. Extract tool name (Required)
+    let name = RE_TOOL_NAME
+        .captures(content)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())?;
+
+    let mut arguments = Map::new();
+
+    // 2. Try Pattern A: "parameter=key>value"
+    for caps in RE_PATTERN_A.captures_iter(content) {
+        if let (Some(k), Some(v)) = (caps.get(1), caps.get(2)) {
+            arguments.insert(
+                k.as_str().to_string(),
+                Value::String(
+                    v.as_str()
+                        .trim_end_matches('"')
+                        .trim_end_matches('}')
+                        .trim()
+                        .to_string(),
+                ),
+            );
+        }
+    }
+
+    // 3. Try Pattern B if A is empty: "<parameter_key>value"
+    if arguments.is_empty() {
+        for caps in RE_PATTERN_B.captures_iter(content) {
+            if let (Some(k), Some(v)) = (caps.get(1), caps.get(2)) {
+                arguments.insert(
+                    k.as_str().to_string(),
+                    Value::String(
+                        v.as_str()
+                            .trim_end_matches(']')
+                            .trim_end_matches('"')
+                            .trim()
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    }
+
+    // 4. Try Pattern C if B is empty: Malformed JSON arguments
+    if arguments.is_empty()
+        && let Some(args_match) = RE_PATTERN_C_ARGS.captures(content)
+    {
+        let raw_args = args_match.get(1).unwrap().as_str();
+        for kv in RE_PATTERN_C_KV.captures_iter(raw_args) {
+            if let (Some(k), Some(v)) = (kv.get(1), kv.get(2)) {
+                arguments.insert(
+                    k.as_str().to_string(),
+                    Value::String(v.as_str().to_string()),
+                );
+            }
+        }
+    }
+
+    // 5. Try Pattern D if C is empty: Single-argument inference
+    if arguments.is_empty() {
+        let single_arg_tools = [
+            ("Bash", "command"),
+            ("Read", "file_path"),
+            ("Write", "file_path"),
+            ("Glob", "pattern"),
+            ("Grep", "pattern"),
+        ];
+
+        if let Some(&(_, param_key)) = single_arg_tools.iter().find(|(t, _)| *t == name) {
+            // Get all remaining text after the name declaration
+            if let Some(name_match) = RE_TOOL_NAME.find(content) {
+                let after_name = &content[name_match.end()..];
+
+                // Clean up JSON noise characters ( { } " , : etc.) and parameter tags
+                let cleaned = after_name
+                    .trim_start_matches(|c: char| {
+                        c.is_whitespace() || c == ',' || c == '"' || c == ':' || c == '{'
+                    })
+                    .trim_end_matches(|c: char| c.is_whitespace() || c == '"' || c == '}');
+
+                let cleaned = RE_PATTERN_A.replace(cleaned, "$2").to_string();
+                let cleaned = RE_PATTERN_B.replace(&cleaned, "$2").to_string();
+
+                if cleaned.len() > 2 {
+                    arguments.insert(
+                        param_key.to_string(),
+                        Value::String(cleaned.trim().to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    if arguments.is_empty() {
+        return None;
+    }
+
+    Some(RecoveredToolCall { name, arguments })
 }
