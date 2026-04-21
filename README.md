@@ -1,4 +1,4 @@
-<h1 align="center">🦀 Crustoxy - Proxy Router for Claude Code built in Rust</h1>
+<h1 align="center">🦀 Crustoxy - Route Claude Code to Any OpenAI-Compatible LLM</h1>
 
 <div align="center">
     <a href="https://sonarcloud.io/summary/new_code?id=omidiyanto_crustoxy">
@@ -20,16 +20,8 @@
 <br>
 
 <div align="center">
-<pre style="color: #E57324; background: transparent; border: 2px dashed #E57324; padding: 16px; border-radius: 10px; display: inline-block;">
- ██████╗██████╗ ██╗   ██╗███████╗████████╗ ██████╗ ██╗  ██╗██╗   ██╗
-██╔════╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
-██║     ██████╔╝██║   ██║███████╗   ██║   ██║   ██║ ╚███╔╝  ╚████╔╝ 
-██║     ██╔══██╗██║   ██║╚════██║   ██║   ██║   ██║ ██╔██╗   ╚██╔╝  
-╚██████╗██║  ██║╚██████╔╝███████║   ██║   ╚██████╔╝██╔╝ ██╗   ██║   
- ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝   ╚═╝   
-</pre>
-
-<h3 align="center"><i>A highly optimized, fast, and secure single-binary web server written in Rust <br> that acts as a proxy router for <a href="https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview">Claude Code</a>.</i></h3>
+    <img src="src/assets/logo.svg" alt="Crustoxy Logo">
+    <h3 align="center"><i>A blazing fast and secure single-binary Rust proxy <br> empowering <a href="https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview">Claude Code</a> with unlimited LLM models flexibility.</i></h3>
 </div>
 
 ## **🤔 Why was Crustoxy created?**  
