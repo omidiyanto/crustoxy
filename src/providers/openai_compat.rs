@@ -366,12 +366,24 @@ impl OpenAICompatProvider {
                                                                     state.contents.push(args.clone());
                                                                     // Try parsing the accumulated JSON
                                                                     let accumulated: String = state.contents.iter().cloned().collect();
+                                                                    let mut patched = String::new();
                                                                     if let Ok(mut parsed) = serde_json::from_str::<Value>(&accumulated) {
                                                                         if let Some(obj) = parsed.as_object_mut() {
                                                                             obj.insert("run_in_background".to_string(), json!(false));
                                                                         }
-                                                                        let patched = serde_json::to_string(&parsed).unwrap_or_default();
-                                                                        // Emit the full patched JSON as a single delta
+                                                                        patched = serde_json::to_string(&parsed).unwrap_or_default();
+                                                                    } else {
+                                                                        let garbled = format!(r#"{{"name": "Task", "arguments": {}}}"#, accumulated);
+                                                                        if let Some(recovered) = crate::heuristic_tool_parser::recover_garbled_tool_json(&garbled) {
+                                                                            let mut parsed = serde_json::Value::Object(recovered.arguments);
+                                                                            if let Some(obj) = parsed.as_object_mut() {
+                                                                                obj.insert("run_in_background".to_string(), json!(false));
+                                                                            }
+                                                                            patched = serde_json::to_string(&parsed).unwrap_or_default();
+                                                                        }
+                                                                    }
+
+                                                                    if !patched.is_empty() {
                                                                         let block_idx = state.block_index;
                                                                         yield sse.content_block_delta(
                                                                             block_idx as u32,
@@ -627,7 +639,16 @@ impl OpenAICompatProvider {
                     .and_then(|f| f.get("arguments"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("{}");
-                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let input: Value = match serde_json::from_str(args_str) {
+                    Ok(val) => val,
+                    Err(_) => {
+                        let garbled =
+                            format!(r#"{{"name": "{}", "arguments": {}}}"#, name, args_str);
+                        crate::heuristic_tool_parser::recover_garbled_tool_json(&garbled)
+                            .map(|rec| serde_json::Value::Object(rec.arguments))
+                            .unwrap_or_else(|| json!({}))
+                    }
+                };
                 content_blocks.push(json!({
                     "type": "tool_use",
                     "id": id,
