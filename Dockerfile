@@ -1,8 +1,9 @@
 FROM rust:1.95-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src ./target/release/deps/crustoxy*
 COPY src/ src/
-RUN cargo build --release
+RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && \
