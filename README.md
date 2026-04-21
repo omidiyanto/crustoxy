@@ -50,6 +50,8 @@ Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely in
 - **Automated IP Rotation**: Automatically executes `warp-cli` sequences to rotate your public Cloudflare WARP IP if all rate-limit retries fail.
 - **Zero-Latency Optimizations**: Intercepts internal Claude Code metadata calls (like Quota probing, conversation title generation, and filepath extraction) and mocks responses instantly, bypassing expensive provider API roundtrips.
 - **Advanced Think Tag Parsing**: Processes inline `<think>...</think>` tags on-the-fly and safely translates them into pure Anthropic `thinking` blocks during the SSE stream.
+- **Heuristic Tool Parsing**: Dynamically detects raw text tool calls (e.g., `<function=Name>...`) emitted by open-source models as a fallback, converting them into valid Anthropic structured tool calls.
+- **VS Code Extension Compatibility**: Fully compatible with the official Claude Code for VS Code extension.
 
 ---
 
@@ -93,13 +95,32 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
    ```
    *The server will start on `http://127.0.0.1:8082`*.
 
-4. **Connect Claude Code**
+4. **Connect Claude Code via CLI**
    Set the API URL for your local Claude Code terminal session:
    ```bash
    export ANTHROPIC_AUTH_TOKEN="sk-ant-dummy"
    export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
    claude
    ```
+
+   **Make it persistent in `~/.bashrc`:**
+   To automatically apply these variables every time you open a terminal, append them to your `~/.bashrc` (or `~/.zshrc`):
+   ```bash
+   echo 'export ANTHROPIC_AUTH_TOKEN="sk-ant-dummy"' >> ~/.bashrc
+   echo 'export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"' >> ~/.bashrc
+   source ~/.bashrc
+   ```
+
+5. **Connect via Claude Code VS Code Extension**
+   Crustoxy is fully compatible with the official Claude Code VS Code extension. To configure it:
+   1. Open VS Code Settings (`Ctrl + ,` or `Cmd + ,` on Mac).
+   2. Search for `@ext:anthropic.claude-code env`.
+   3. Under **Claude Code > Environment Variables**:
+      - Click **Add Item**.
+      - Set Item to `ANTHROPIC_BASE_URL` and Value to `http://127.0.0.1:8082`
+      - Click **Add Item** again.
+      - Set Item to `ANTHROPIC_AUTH_TOKEN` and Value to `sk-ant-dummy`
+   4. Reload the extension or restart VS Code for the environment variables to take effect.
 
 ---
 
