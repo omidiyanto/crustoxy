@@ -38,6 +38,11 @@ pub async fn create_message(
     headers: HeaderMap,
     axum::extract::Json(mut request): axum::extract::Json<MessagesRequest>,
 ) -> Response {
+    tracing::trace!(
+        "Incoming JSON payload: {}",
+        serde_json::to_string(&request).unwrap_or_default()
+    );
+
     if let Err(r) = check_auth(&headers, &state.settings) {
         return r;
     }
@@ -106,6 +111,11 @@ pub async fn count_tokens(
     headers: HeaderMap,
     Json(request): Json<TokenCountRequest>,
 ) -> Response {
+    tracing::trace!(
+        "Incoming count_tokens JSON payload: {}",
+        serde_json::to_string(&request).unwrap_or_default()
+    );
+
     if let Err(r) = check_auth(&headers, &state.settings) {
         return r;
     }
