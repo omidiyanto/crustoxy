@@ -619,7 +619,9 @@ impl OpenAICompatProvider {
         }
 
         // Reasoning content
-        let reasoning_val = message.get("reasoning_content").or_else(|| message.get("reasoning"));
+        let reasoning_val = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"));
         if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
             && !reasoning.is_empty()
         {
