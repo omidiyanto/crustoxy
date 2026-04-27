@@ -30,7 +30,7 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCallObj>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
 }
 
@@ -83,7 +83,7 @@ pub struct ChunkChoice {
 pub struct ChunkDelta {
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(default)]
+    #[serde(alias = "reasoning", default)]
     pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<DeltaToolCall>>,

@@ -619,7 +619,8 @@ impl OpenAICompatProvider {
         }
 
         // Reasoning content
-        if let Some(reasoning) = message.get("reasoning_content").and_then(|v| v.as_str())
+        let reasoning_val = message.get("reasoning_content").or_else(|| message.get("reasoning"));
+        if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
             && !reasoning.is_empty()
         {
             content_blocks.push(json!({"type": "thinking", "thinking": reasoning}));
