@@ -98,8 +98,7 @@ pub struct TrajectoryStep {
     pub error_text: String,
 }
 
-/// Step type constants.
-pub const STEP_TYPE_PLANNER_RESPONSE: u64 = 15;
+
 /// Error step type — indicates the cascade refused the request.
 pub const STEP_TYPE_ERROR_MESSAGE: u64 = 17;
 

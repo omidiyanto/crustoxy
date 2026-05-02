@@ -158,8 +158,8 @@ pub static MODELS: &[WindsurfModel] = &[
     },
     WindsurfModel {
         name: "gemini-2.5-flash",
-        enum_value: 316,
-        model_uid: "MODEL_GEMINI_2_5_FLASH",
+        enum_value: 312,
+        model_uid: "MODEL_GOOGLE_GEMINI_2_5_FLASH",
     },
     // ── Kimi ──
     WindsurfModel {

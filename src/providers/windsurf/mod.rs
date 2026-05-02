@@ -22,7 +22,7 @@ use crate::models::anthropic::{MessagesRequest, extract_text_from_system};
 use self::grpc::{GrpcSession, default_csrf_token};
 use self::ls::LanguageServer;
 use self::parsers::{
-    STEP_STATUS_DONE, STEP_STATUS_GENERATING, STEP_TYPE_ERROR_MESSAGE, STEP_TYPE_PLANNER_RESPONSE,
+    STEP_STATUS_DONE, STEP_STATUS_GENERATING, STEP_TYPE_ERROR_MESSAGE,
     TrajectoryStatus,
 };
 
@@ -43,8 +43,7 @@ struct StreamCtx<'a> {
 /// Exchange a Codeium auth token for a Windsurf API key.
 /// Tries register.windsurf.com first, falls back to api.codeium.com.
 pub async fn register_codeium_token(token: &str) -> Result<(String, String), String> {
-    // Strip ott$ prefix if present (WindsurfAPI compatibility)
-    let clean_token = token.strip_prefix("ott$").unwrap_or(token);
+    let clean_token = token;
 
     let body = serde_json::json!({ "firebase_id_token": clean_token });
     let body_str = body.to_string();
@@ -495,10 +494,7 @@ impl WindsurfProvider {
                     return Err(format!("Cascade error (step type 17): {}", msg));
                 }
 
-                // Only process planner response steps
-                if step.step_type != STEP_TYPE_PLANNER_RESPONSE {
-                    continue;
-                }
+                // Upstream doesn't filter by step_type for text. Any step with text is yielded.
                 if step.status != STEP_STATUS_GENERATING && step.status != STEP_STATUS_DONE {
                     continue;
                 }
