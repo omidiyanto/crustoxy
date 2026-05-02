@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tracing::{debug, trace};
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -10,13 +12,18 @@ use uuid::Uuid;
 use crate::auth::validate_api_key;
 use crate::config::Settings;
 use crate::converter::count_request_tokens;
-use crate::models::anthropic::{MessagesRequest, TokenCountRequest};
+use crate::models::anthropic::{
+    MessagesRequest, SystemPrompt, TokenCountRequest, extract_text_from_system,
+};
 use crate::optimization::try_optimizations;
 use crate::providers::OpenAICompatProvider;
+use crate::providers::WindsurfProvider;
+use crate::rtk;
 
 pub struct AppState {
     pub settings: Settings,
     pub provider: OpenAICompatProvider,
+    pub windsurf_provider: Option<std::sync::Arc<WindsurfProvider>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -38,6 +45,10 @@ pub async fn create_message(
     headers: HeaderMap,
     axum::extract::Json(mut request): axum::extract::Json<MessagesRequest>,
 ) -> Response {
+    trace!(
+        "Incoming request payload: {}",
+        serde_json::to_string(&request).unwrap_or_default()
+    );
     if let Err(r) = check_auth(&headers, &state.settings) {
         return r;
     }
@@ -58,12 +69,90 @@ pub async fn create_message(
     request.resolved_provider_model = Some(resolved.clone());
     request.model = Settings::parse_model_name(&resolved).to_string();
 
+    // Apply system prompt transformations (RTK compaction / override)
+    if state.settings.override_system_prompt.is_some() || state.settings.enable_rtk {
+        let sys_text = extract_text_from_system(&request.system);
+        if !sys_text.is_empty() {
+            let transformed = rtk::apply_system_prompt_transform(
+                &sys_text,
+                &state.settings.override_system_prompt,
+                state.settings.enable_rtk,
+            );
+
+            let orig_len = sys_text.len();
+            let new_len = transformed.len();
+            if orig_len != new_len {
+                debug!(
+                    "RTK applied: system prompt compacted from {} to {} chars",
+                    orig_len, new_len
+                );
+                trace!("Original system prompt:\n{}", sys_text);
+                trace!("Transformed system prompt:\n{}", transformed);
+            }
+
+            request.system = Some(SystemPrompt::Text(transformed));
+        }
+    }
+
     if let Some(optimized) = try_optimizations(&request, &state.settings) {
         return Json(optimized).into_response();
     }
 
     let request_id = format!("req_{}", &Uuid::new_v4().to_string()[..12]);
     let input_tokens = count_request_tokens(&request);
+
+    // Check if this request should go to the Windsurf provider
+    let provider_type = request
+        .resolved_provider_model
+        .as_deref()
+        .map(Settings::parse_provider_type)
+        .unwrap_or("");
+
+    if provider_type == "windsurf" {
+        if let Some(ref ws) = state.windsurf_provider {
+            if request.stream == Some(false) {
+                let result = ws
+                    .send_non_streaming(&request, input_tokens, &request_id)
+                    .await;
+                return match result {
+                    Ok(response_json) => Json(response_json).into_response(),
+                    Err(e) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": e}
+                        })),
+                    )
+                        .into_response(),
+                };
+            }
+
+            let stream = ws.stream_response(&request, input_tokens, &request_id);
+            let body_stream =
+                tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
+
+            return Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .header("X-Accel-Buffering", "no")
+                .body(Body::from_stream(body_stream))
+                .unwrap();
+        } else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Windsurf provider not enabled. Set CODEIUM_AUTH_TOKEN to enable."
+                    }
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // Non-streaming path (fallback — only when client explicitly sets stream: false)
     if request.stream == Some(false) {
@@ -135,6 +224,18 @@ pub async fn count_tokens(
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let provider_type = Settings::parse_provider_type(&state.settings.model);
+
+    let windsurf_status = match state.windsurf_provider {
+        Some(ref ws) => {
+            if ws.is_healthy().await {
+                "healthy"
+            } else {
+                "unhealthy"
+            }
+        }
+        None => "disabled",
+    };
+
     Json(json!({
         "status": "healthy",
         "model": state.settings.model,
@@ -143,6 +244,8 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         "features": {
             "ip_rotation": state.settings.enable_ip_rotation,
             "tool_retry": state.settings.enable_tool_retry,
+            "rtk": state.settings.enable_rtk,
+            "windsurf": windsurf_status,
         }
     }))
 }

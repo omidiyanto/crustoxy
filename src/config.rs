@@ -160,6 +160,15 @@ pub struct Settings {
     pub enable_filepath_extraction_mock: bool,
     pub enable_tool_retry: bool,
     pub tool_retry_max: u32,
+    // RTK token optimization
+    pub enable_rtk: bool,
+    pub override_system_prompt: Option<String>,
+    // Windsurf provider (auto-enabled when codeium_auth_token is set)
+    pub codeium_auth_token: Option<String>,
+    pub windsurf_ls_path: String,
+    pub windsurf_ls_port: u16,
+    pub windsurf_api_server_url: String,
+    pub windsurf_data_dir: String,
 }
 
 impl Settings {
@@ -195,6 +204,19 @@ impl Settings {
                 .unwrap_or(true),
             enable_tool_retry: env_or("ENABLE_TOOL_RETRY", "true").parse().unwrap_or(true),
             tool_retry_max: env_or("TOOL_RETRY_MAX", "2").parse().unwrap_or(2),
+            enable_rtk: env_or("ENABLE_RTK", "true").parse().unwrap_or(true),
+            override_system_prompt: env_or_none("OVERRIDE_SYSTEM_PROMPT"),
+            codeium_auth_token: env_or_none("CODEIUM_AUTH_TOKEN"),
+            windsurf_ls_path: env_or(
+                "WINDSURF_LS_PATH",
+                "/opt/windsurf/language_server_linux_x64",
+            ),
+            windsurf_ls_port: env_or("WINDSURF_LS_PORT", "42100").parse().unwrap_or(42100),
+            windsurf_api_server_url: env_or(
+                "WINDSURF_API_SERVER_URL",
+                "https://server.self-serve.windsurf.com",
+            ),
+            windsurf_data_dir: env_or("WINDSURF_DATA_DIR", "/opt/windsurf/data"),
         }
     }
 

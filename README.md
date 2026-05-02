@@ -29,16 +29,18 @@ This project was built to unleash the extraordinary potential of *Claude Code*. 
 
 Furthermore, this tool is fortified by a robust plugin ecosystem enabling smooth integration with various third-party services. It comes wrapped in enterprise-grade security and governance features such as anti-destructive guardrails, strict access management, and high-level privacy standards. This makes it an instant, secure, and infinitely more comprehensive plug-and-play solution for industrial scale when compared to rigid open-source alternatives.
 
-Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely interact with 24+ different LLM providers (such as OpenAI, OpenRouter, Groq, DeepSeek, Google Gemini, Ollama, etc.), liberating it from the exclusivity constraints of the Anthropic API.
+Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely interact with 24+ different LLM providers (such as OpenAI, OpenRouter, Windsurf, Groq, DeepSeek, Google Gemini, Ollama, etc.), liberating it from the exclusivity constraints of the Anthropic API.
 
 ## 🎯 Core Features
 
 - **Blazing Fast & Lightweight**: Written in pure Rust using `axum`, boasting near-zero proxy latency and an extremely minimal memory footprint perfect for long-running daemonized processes.
 - **Anthropic ↔ OpenAI Compat API**: Automatically translates Anthropic's complex proprietary API requests (such as `messages`, `system`, `tools`, `thinking`) into standard, universally accepted OpenAI-compatible API requests. It then seamlessly streams the responses back using Anthropic's exact SSE (Server-Sent Events) formatting and event sequences.
-- **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, driven directly by your simple `.env` configuration.
+- **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Windsurf, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, driven directly by your simple `.env` configuration.
 - **Smart 429 Rate Limit Deflection**:
   - Proactive algorithmic sliding window rate limiter that intelligently throttles concurrent bursts *before* provider limits are hit.
   - Reactive blocking with customizable exponential backoff and jitter retries when an HTTP `429` is eventually encountered.
+- **Native Windsurf Integration (Embedded)**: Instead of routing through an external Windsurf proxy, Crustoxy natively spawns and communicates directly with the Windsurf language server binary via gRPC over HTTP/2 cleartext (h2c). Supports both the Cascade flow (modern models) and RawGetChatMessage (legacy models) with automatic model resolution and streaming SSE output. Disabled by default; activates automatically when `CODEIUM_AUTH_TOKEN` is set. API keys are persisted to `accounts.json` so tokens are only exchanged once.
+- **RTK Token Optimization (System Prompt Compact)**: Automatically compacts Claude Code's notoriously large system prompts (often 4,000+ tokens) into a concise, factual RTK-style format (as low as 200–300 tokens) by extracting essential metadata (workspace, platform, OS) and discarding boilerplate. Saves significant token budget on every turn. Optional full override via `OVERRIDE_SYSTEM_PROMPT`.
 - **Automated IP Rotation (Anti-WAF Shield)**: Actively communicates with a localized `warp-svc` daemon to automatically trigger `warp-cli` disconnection and registration renewal sequences, rotating your public Cloudflare WARP IPv4/IPv6 if all passive rate-limit retries fail to bypass IP-based blocks.
 - **Zero-Latency Agentic Mocking**: Intercepts expensive internal Claude Code workspace telemetry calls (such as Quota probing, conversation title generation, and OS filepath constraint extraction) and mocks the responses instantly on the edge, bypassing wasteful API roundtrips and heavily saving token costs.
 - **Advanced Think & Thought Tag Extraction**: Stateful stream parsing that intercepts inline deep-reasoning tags (`<think>...` or `<thought>...`) emitted by Open-Weights models on-the-fly, safely relocating their contents into pure, native Anthropic `thinking` blocks without interrupting the main text stream.
@@ -75,11 +77,18 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
 2. **Edit `.env`**
    Add your preferred provider API keys and setup which model you want to default to:
    ```env
-   # Set default routing target
+   # Set default routing target (use windsurf/ prefix for native Windsurf)
    MODEL=openrouter/meta-llama/llama-3-8b-instruct:free
 
    OPENROUTER_API_KEY=sk-or-v1-yourapikey
    OLLAMA_BASE_URL=http://localhost:11434/v1
+
+   # Optional: enable native Windsurf provider integration
+   # CODEIUM_AUTH_TOKEN="ott$$eyJhbGciOi....."
+
+   # Optional: compact Claude Code system prompts (enabled by default)
+   # ENABLE_RTK=true
+   # OVERRIDE_SYSTEM_PROMPT=Your custom system prompt here
    ```
 
 3. **Build & Run Locally**
@@ -142,6 +151,64 @@ docker-compose logs -f
 
 ---
 
+## 🌊 Native Windsurf Provider
+
+Crustoxy embeds the Windsurf language server binary directly — no external proxy required. When `CODEIUM_AUTH_TOKEN` is set, any request targeting a model prefixed with `windsurf/` (e.g., `windsurf/kimi-k2-6` or `windsurf/glm-4.7`) is routed natively through gRPC over HTTP/2 cleartext (h2c) to the local language server, which in turn communicates with Windsurf's upstream cloud.
+
+### How it works
+1. **Token exchange** — On first startup, `CODEIUM_AUTH_TOKEN` is exchanged for a Windsurf API key via `register.windsurf.com` (falling back to `api.codeium.com`). The key is saved to `accounts.json` so subsequent restarts skip the exchange.
+2. **Binary spawn** — Crustoxy spawns the Windsurf language server binary (`language_server_linux_x64`) on a configurable local port (`42100` by default).
+3. **Workspace init** — A 4-step gRPC handshake (InitializeCascadePanelState → AddTrackedWorkspace → UpdateWorkspaceTrust → Heartbeat) prepares the session.
+4. **Cascade vs Raw flows** — Modern Windsurf models use the Cascade flow (`StartCascade → SendUserCascadeMessage → poll trajectory steps`). Legacy/enum-only models fall back to `RawGetChatMessage` streaming.
+5. **SSE output** — Responses are always streamed back using standard Anthropic SSE formatting.
+
+### Quick setup
+
+```bash
+# Set your Codeium auth token. 
+# 1. Get it from: https://windsurf.com/show-auth-token (or from Windsurf IDE: "Codeium: Show Auth Token")
+# 2. IMPORTANT: If your token contains a '$' character (which is common), you MUST 
+#    escape it by writing '$$' in your .env file or docker-compose to prevent interpolation errors.
+CODEIUM_AUTH_TOKEN="ott$$eyJhbGciOiJSUzI1Ni..."
+
+# Route any model slot to a Windsurf model
+MODEL=windsurf/glm-4.7
+# or per-tier:
+MODEL_SONNET=windsurf/kimi-k2-6
+MODEL_OPUS=windsurf/kimi-k2-thinking
+MODEL_HAIKU=windsurf/claude-4.5-haiku
+```
+
+### Docker considerations
+
+The official Docker image already downloads and installs the Windsurf language server binary at `/opt/windsurf/language_server_linux_x64`. A named volume `windsurf-data` persists the language server's internal database, session cache, and `accounts.json` across container restarts.
+
+If you prefer to run natively, download the binary manually:
+```bash
+mkdir -p /opt/windsurf
+curl -fL "https://api.github.com/repos/Exafunction/codeium/releases/latest" \
+     -o /opt/windsurf/language_server_linux_x64
+chmod +x /opt/windsurf/language_server_linux_x64
+```
+
+### Health check
+
+The `/health` endpoint reports Windsurf status:
+```json
+{
+  "status": "healthy",
+  "features": {
+    "windsurf": "healthy",
+    "rtk": true
+  }
+}
+```
+- `disabled` — `CODEIUM_AUTH_TOKEN` is not set.
+- `healthy` — Language server is running and accepting gRPC connections.
+- `unhealthy` — Language server process has exited or is not responding.
+
+---
+
 ## ⚙️ Configuration Parameters
 
 You can fine-tune Crustoxy to fit your exact infrastructure requirements via the `.env` file. Below are the configurations and what they govern:
@@ -169,7 +236,18 @@ Crustoxy employs algorithmic Sliding Window limits to prevent your account from 
 ### 5. IP Rotation
 - `ENABLE_IP_ROTATION` *(default: `true`)*: If set to true, seamlessly communicates with `warp-cli` to switch IP allocations when a provider enforces persistent IP-based `429` blocks. (Requires Cloudflare WARP daemon).
 
-### 6. Optimizations & Safety Nets
+### 6. RTK System Prompt Optimization
+- `ENABLE_RTK` *(default: `true`)*: When enabled, Claude Code's massive default system prompt (4,000–8,000 tokens) is automatically compacted into a concise RTK-style factual summary (200–300 tokens). Essential metadata (workspace path, OS platform, OS version) is preserved; repetitive instructional boilerplate is stripped.
+- `OVERRIDE_SYSTEM_PROMPT`: Leave blank to use RTK-compacted prompt. Set to any text string to fully replace the system prompt sent to the provider, bypassing both the original and the RTK-compacted version.
+
+### 7. Windsurf Native Integration
+- `CODEIUM_AUTH_TOKEN`: Auth token from the Windsurf IDE (run "Codeium: Show Auth Token"). On first startup, it's exchanged for a Windsurf API key via `register.windsurf.com` and persisted to `accounts.json`. Subsequent restarts reuse the saved key.
+- `WINDSURF_LS_PATH` *(default: `/opt/windsurf/language_server_linux_x64`)*: Path to the Windsurf language server binary.
+- `WINDSURF_LS_PORT` *(default: `42100`)*: Local gRPC port the language server listens on.
+- `WINDSURF_API_SERVER_URL` *(default: `https://server.self-serve.windsurf.com`)*: The upstream Windsurf cloud API server endpoint.
+- `WINDSURF_DATA_DIR` *(default: `/opt/windsurf/data`)*: Directory for persisting `accounts.json` and language server data.
+
+### 8. Optimizations & Safety Nets
 - `ENABLE_NETWORK_PROBE_MOCK` / `ENABLE_TITLE_GENERATION_SKIP` / `ENABLE_SUGGESTION_MODE_SKIP` / `ENABLE_FILEPATH_EXTRACTION_MOCK`: Set to `true` to intercept internal telemetry and UI-aesthetic requests heavily spammed by Claude Code. Crustoxy mocks perfect responses instantly, slashing your API token costs heavily.
 - `ENABLE_TOOL_RETRY` *(default: `true`)*: Activates the active Auto-Retry Pipeline. When set to true, if a model writes sentences indicating it wants to use a tool (e.g. "Let me run a command") but fails to actually output the structured tool JSON, Crustoxy will silently push the context back and force the model to retry.
 - `TOOL_RETRY_MAX` *(default: `2`)*: The maximum amount of times Crustoxy is allowed to automatically retry the provider per single user prompt.
@@ -182,6 +260,7 @@ No need to figure out endpoint definitions. Just pop in your `API_KEY` for any o
 
 | Provider | Env Prefix | Built-in Base URL |
 | :--- | :--- | :--- |
+| **Windsurf (Native gRPC)** | `CODEIUM_AUTH_TOKEN` | `https://server.self-serve.windsurf.com` (internal LS) |
 | **OpenAI** | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
 | **OpenRouter** | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
 | **Groq** | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
