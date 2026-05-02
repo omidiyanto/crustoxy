@@ -10,15 +10,19 @@ FROM debian:bookworm-slim AS windsurf-dl
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /opt/windsurf && \
     ASSET="language_server_linux_x64" && \
-    PRIMARY="https://api.github.com/repos/Exafunction/codeium/releases/latest" && \
-    FALLBACK_API="https://github.com/dwgx/WindsurfAPI/releases/latest/download/${ASSET}" && \
-    if curl -fL --retry 3 -o "/opt/windsurf/${ASSET}" "${PRIMARY}"; then \
-      echo "Downloaded from WindsurfAPI release"; \
+    PRIMARY_API="https://api.github.com/repos/Exafunction/codeium/releases/latest" && \
+    FALLBACK_URL="https://github.com/dwgx/WindsurfAPI/releases/latest/download/${ASSET}" && \
+    echo "Fetching release info from Exafunction..." && \
+    URL="$(curl -fsSL "${PRIMARY_API}" | grep -oE "https://[^\"]+/${ASSET}" | head -1)" || true && \
+    if [ -n "$URL" ] && curl -fL --retry 3 -o "/opt/windsurf/${ASSET}" "${URL}"; then \
+      echo "Downloaded successfully from Exafunction"; \
     else \
-      echo "Primary failed, trying Exafunction fallback..."; \
-      URL="$(curl -fsSL "${FALLBACK_API}" | grep -oE "https://[^\"]+/${ASSET}" | head -1)"; \
-      if [ -z "$URL" ]; then echo "ERROR: Could not find LS binary in any release" && exit 1; fi; \
-      curl -fL --retry 3 -o "/opt/windsurf/${ASSET}" "${URL}"; \
+      echo "Exafunction failed, trying WindsurfAPI fallback..."; \
+      if curl -fL --retry 3 -o "/opt/windsurf/${ASSET}" "${FALLBACK_URL}"; then \
+        echo "Downloaded from WindsurfAPI fallback"; \
+      else \
+        echo "ERROR: Could not download LS binary from any source" && exit 1; \
+      fi; \
     fi && \
     chmod +x "/opt/windsurf/${ASSET}"
 
