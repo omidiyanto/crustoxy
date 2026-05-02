@@ -22,8 +22,7 @@ use crate::models::anthropic::{MessagesRequest, extract_text_from_system};
 use self::grpc::{GrpcSession, default_csrf_token};
 use self::ls::LanguageServer;
 use self::parsers::{
-    STEP_STATUS_DONE, STEP_STATUS_GENERATING, STEP_TYPE_ERROR_MESSAGE,
-    TrajectoryStatus,
+    STEP_STATUS_DONE, STEP_STATUS_GENERATING, STEP_TYPE_ERROR_MESSAGE, TrajectoryStatus,
 };
 
 /// gRPC service paths for the language server.
