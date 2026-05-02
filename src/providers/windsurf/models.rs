@@ -16,9 +16,7 @@ pub struct WindsurfModel {
 impl WindsurfModel {
     /// Cascade flow is used when model_uid is non-empty.
     pub fn use_cascade(&self) -> bool {
-        // ALWAYS use RawGetChatMessage because Cascade intercepts tool calls
-        // and throws "invalid tool call" when claude-code outputs native tools.
-        false
+        !self.model_uid.is_empty()
     }
 }
 
