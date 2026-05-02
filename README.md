@@ -241,7 +241,7 @@ Crustoxy employs algorithmic Sliding Window limits to prevent your account from 
 - `OVERRIDE_SYSTEM_PROMPT`: Leave blank to use RTK-compacted prompt. Set to any text string to fully replace the system prompt sent to the provider, bypassing both the original and the RTK-compacted version.
 
 ### 7. Windsurf Native Integration
-- `CODEIUM_AUTH_TOKEN`: Auth token from the Windsurf IDE (run "Codeium: Show Auth Token"). On first startup, it's exchanged for a Windsurf API key via `register.windsurf.com` and persisted to `accounts.json`. Subsequent restarts reuse the saved key.
+- `CODEIUM_AUTH_TOKEN`: Auth token from Windsurf. Obtain it via `https://windsurf.com/show-auth-token` (or from the Windsurf IDE command "Codeium: Show Auth Token"). **IMPORTANT:** If your token contains a `$` character, you must write it as `$$` in the `.env` file to escape interpolation. On first startup, it's exchanged for a Windsurf API key via `register.windsurf.com` and persisted to `accounts.json`. Subsequent restarts reuse the saved key.
 - `WINDSURF_LS_PATH` *(default: `/opt/windsurf/language_server_linux_x64`)*: Path to the Windsurf language server binary.
 - `WINDSURF_LS_PORT` *(default: `42100`)*: Local gRPC port the language server listens on.
 - `WINDSURF_API_SERVER_URL` *(default: `https://server.self-serve.windsurf.com`)*: The upstream Windsurf cloud API server endpoint.
