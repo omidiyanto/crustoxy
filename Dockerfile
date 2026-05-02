@@ -10,8 +10,8 @@ FROM debian:bookworm-slim AS windsurf-dl
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /opt/windsurf && \
     ASSET="language_server_linux_x64" && \
-    PRIMARY="https://github.com/dwgx/WindsurfAPI/releases/latest/download/${ASSET}" && \
-    FALLBACK_API="https://api.github.com/repos/Exafunction/codeium/releases/latest" && \
+    PRIMARY="https://api.github.com/repos/Exafunction/codeium/releases/latest" && \
+    FALLBACK_API="https://github.com/dwgx/WindsurfAPI/releases/latest/download/${ASSET}" && \
     if curl -fL --retry 3 -o "/opt/windsurf/${ASSET}" "${PRIMARY}"; then \
       echo "Downloaded from WindsurfAPI release"; \
     else \

@@ -153,7 +153,7 @@ docker-compose logs -f
 
 ## 🌊 Native Windsurf Provider
 
-Crustoxy embeds the Windsurf language server binary directly — no external proxy required. When `CODEIUM_AUTH_TOKEN` is set, any request targeting a model prefixed with `windsurf/` (e.g., `windsurf/claude-sonnet-4` or `windsurf/gpt-4o`) is routed natively through gRPC over HTTP/2 cleartext (h2c) to the local language server, which in turn communicates with Windsurf's upstream cloud.
+Crustoxy embeds the Windsurf language server binary directly — no external proxy required. When `CODEIUM_AUTH_TOKEN` is set, any request targeting a model prefixed with `windsurf/` (e.g., `windsurf/kimi-k2-6` or `windsurf/glm-4.7`) is routed natively through gRPC over HTTP/2 cleartext (h2c) to the local language server, which in turn communicates with Windsurf's upstream cloud.
 
 ### How it works
 1. **Token exchange** — On first startup, `CODEIUM_AUTH_TOKEN` is exchanged for a Windsurf API key via `register.windsurf.com` (falling back to `api.codeium.com`). The key is saved to `accounts.json` so subsequent restarts skip the exchange.
@@ -172,10 +172,10 @@ Crustoxy embeds the Windsurf language server binary directly — no external pro
 CODEIUM_AUTH_TOKEN="ott$$eyJhbGciOiJSUzI1Ni..."
 
 # Route any model slot to a Windsurf model
-MODEL=windsurf/claude-sonnet-4
+MODEL=windsurf/glm-4.7
 # or per-tier:
-MODEL_SONNET=windsurf/claude-4.5-sonnet
-MODEL_OPUS=windsurf/claude-4.5-opus
+MODEL_SONNET=windsurf/kimi-k2-6
+MODEL_OPUS=windsurf/kimi-k2-thinking
 MODEL_HAIKU=windsurf/claude-4.5-haiku
 ```
 
@@ -186,7 +186,7 @@ The official Docker image already downloads and installs the Windsurf language s
 If you prefer to run natively, download the binary manually:
 ```bash
 mkdir -p /opt/windsurf
-curl -fL "https://github.com/dwgx/WindsurfAPI/releases/latest/download/language_server_linux_x64" \
+curl -fL "https://api.github.com/repos/Exafunction/codeium/releases/latest" \
      -o /opt/windsurf/language_server_linux_x64
 chmod +x /opt/windsurf/language_server_linux_x64
 ```
