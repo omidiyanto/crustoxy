@@ -173,11 +173,32 @@ pub fn extract_text_from_content(content: &MessageContent) -> String {
             for block in blocks {
                 match block {
                     ContentBlock::Text { text } => parts.push(text.clone()),
-                    ContentBlock::Thinking { thinking } => parts.push(thinking.clone()),
+                    ContentBlock::Thinking { thinking } => {
+                        parts.push(format!("<think>\n{}\n</think>", thinking))
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        let input_str = serde_json::to_string_pretty(input).unwrap_or_default();
+                        parts.push(format!("<tool_use>\n<id>{}</id>\n<name>{}</name>\n<input>\n{}\n</input>\n</tool_use>", id, name, input_str));
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        let result_str = match content {
+                            ToolResultContent::Text(s) => s.clone(),
+                            ToolResultContent::Blocks(b) => {
+                                serde_json::to_string_pretty(b).unwrap_or_default()
+                            }
+                        };
+                        parts.push(format!(
+                            "<tool_result tool_use_id=\"{}\">\n{}\n</tool_result>",
+                            tool_use_id, result_str
+                        ));
+                    }
                     _ => {}
                 }
             }
-            parts.join("\n")
+            parts.join("\n\n")
         }
     }
 }
