@@ -21,9 +21,7 @@ use crate::models::anthropic::{MessagesRequest, extract_text_from_system};
 
 use self::grpc::{GrpcSession, default_csrf_token};
 use self::ls::LanguageServer;
-use self::parsers::{
-    STEP_STATUS_DONE, STEP_STATUS_GENERATING, STEP_TYPE_ERROR_MESSAGE, TrajectoryStatus,
-};
+use self::parsers::{STEP_TYPE_ERROR_MESSAGE, TrajectoryStatus};
 
 /// gRPC service paths for the language server.
 const SVC: &str = "/exa.language_server_pb.LanguageServerService";
@@ -438,13 +436,17 @@ impl WindsurfProvider {
         debug!("Windsurf [{}]: SendUserCascadeMessage OK", request_id);
 
         // 4. Poll GetCascadeTrajectorySteps — per-step cursor tracking like WindsurfAPI
-        let mut step_offset: u64 = 0;
+        let step_offset: u64 = 0;
         let mut yielded_by_step: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        let mut thinking_by_step: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
         let mut total_yielded: usize = 0;
         let mut saw_text = false;
         let mut saw_active = false;
         let mut idle_count = 0;
+        let mut block_index: u32 = 0;
+        let mut active_block: Option<String> = None;
         let poll_interval = std::time::Duration::from_millis(500);
         let max_wait = std::time::Duration::from_secs(300);
         let started = std::time::Instant::now();
@@ -493,9 +495,33 @@ impl WindsurfProvider {
                     return Err(format!("Cascade error (step type 17): {}", msg));
                 }
 
-                // Upstream doesn't filter by step_type for text. Any step with text is yielded.
-                if step.status != STEP_STATUS_GENERATING && step.status != STEP_STATUS_DONE {
-                    continue;
+                // Thinking extraction
+                let live_think = &step.thinking;
+                if !live_think.is_empty() {
+                    let prev_think = thinking_by_step.get(&abs_idx).copied().unwrap_or(0);
+                    if live_think.len() > prev_think {
+                        let think_delta = &live_think[prev_think..];
+                        thinking_by_step.insert(abs_idx, live_think.len());
+                        last_growth_at = std::time::Instant::now();
+
+                        if active_block.as_deref() != Some("thinking") {
+                            if active_block.is_some() {
+                                let stop_event = crate::sse::format_block_stop(block_index);
+                                let _ = tx.send(bytes::Bytes::from(stop_event)).await;
+                                block_index += 1;
+                            }
+                            active_block = Some("thinking".to_string());
+                            let start_event =
+                                crate::sse::format_block_start(block_index, "thinking");
+                            let _ = tx.send(bytes::Bytes::from(start_event)).await;
+                        }
+
+                        let think_event =
+                            crate::sse::format_block_delta(block_index, "thinking", think_delta);
+                        tx.send(bytes::Bytes::from(think_event))
+                            .await
+                            .map_err(|_| "Channel closed".to_string())?;
+                    }
                 }
 
                 // Use response_text for streaming (monotonic, append-only)
@@ -516,14 +542,23 @@ impl WindsurfProvider {
                     last_growth_at = std::time::Instant::now();
                     saw_text = true;
 
-                    let delta_event = crate::sse::format_content_delta(delta, 0);
+                    if active_block.as_deref() != Some("text") {
+                        if active_block.is_some() {
+                            let stop_event = crate::sse::format_block_stop(block_index);
+                            let _ = tx.send(bytes::Bytes::from(stop_event)).await;
+                            block_index += 1;
+                        }
+                        active_block = Some("text".to_string());
+                        let start_event = crate::sse::format_block_start(block_index, "text");
+                        let _ = tx.send(bytes::Bytes::from(start_event)).await;
+                    }
+
+                    let delta_event = crate::sse::format_block_delta(block_index, "text", delta);
                     tx.send(bytes::Bytes::from(delta_event))
                         .await
                         .map_err(|_| "Channel closed".to_string())?;
                 }
             }
-
-            step_offset += steps.len() as u64;
 
             // Warm stall detection
             if saw_text && last_growth_at.elapsed() > no_growth_stall {
@@ -569,6 +604,11 @@ impl WindsurfProvider {
             } else {
                 idle_count = 0;
             }
+        }
+
+        if active_block.is_some() {
+            let stop_event = crate::sse::format_block_stop(block_index);
+            let _ = tx.send(bytes::Bytes::from(stop_event)).await;
         }
 
         // Send message_stop event

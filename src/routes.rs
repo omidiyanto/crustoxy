@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tracing::{debug, trace};
+
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -43,6 +45,10 @@ pub async fn create_message(
     headers: HeaderMap,
     axum::extract::Json(mut request): axum::extract::Json<MessagesRequest>,
 ) -> Response {
+    trace!(
+        "Incoming request payload: {}",
+        serde_json::to_string(&request).unwrap_or_default()
+    );
     if let Err(r) = check_auth(&headers, &state.settings) {
         return r;
     }
@@ -72,6 +78,18 @@ pub async fn create_message(
                 &state.settings.override_system_prompt,
                 state.settings.enable_rtk,
             );
+
+            let orig_len = sys_text.len();
+            let new_len = transformed.len();
+            if orig_len != new_len {
+                debug!(
+                    "RTK applied: system prompt compacted from {} to {} chars",
+                    orig_len, new_len
+                );
+                trace!("Original system prompt:\n{}", sys_text);
+                trace!("Transformed system prompt:\n{}", transformed);
+            }
+
             request.system = Some(SystemPrompt::Text(transformed));
         }
     }

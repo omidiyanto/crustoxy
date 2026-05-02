@@ -12,7 +12,7 @@ services:
       - .env
     volumes:
       # Persist Windsurf LS data (session cache, database) across restarts
-      - windsurf-data:/opt/windsurf/data
+      - ./data:/opt/windsurf/data
     # Note: NET_ADMIN capability and /dev/net/tun device are required 
     # for Cloudflare WARP to properly establish a connection inside the container.
     cap_add:
@@ -21,6 +21,3 @@ services:
       - /dev/net/tun:/dev/net/tun
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
-
-volumes:
-  windsurf-data:

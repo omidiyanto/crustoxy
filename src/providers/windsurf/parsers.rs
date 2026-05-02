@@ -87,7 +87,6 @@ pub fn parse_trajectory_status(buf: &[u8]) -> TrajectoryStatus {
 #[derive(Debug, Clone)]
 pub struct TrajectoryStep {
     pub step_type: u64,
-    pub status: u64,
     /// Raw response text (field 1 of planner_response) — append-only during streaming.
     pub response_text: String,
     /// Modified response text (field 8 of planner_response) — LS post-pass rewrite.
@@ -100,10 +99,6 @@ pub struct TrajectoryStep {
 
 /// Error step type — indicates the cascade refused the request.
 pub const STEP_TYPE_ERROR_MESSAGE: u64 = 17;
-
-/// Step status constants.
-pub const STEP_STATUS_DONE: u64 = 3;
-pub const STEP_STATUS_GENERATING: u64 = 8;
 
 /// Parse GetCascadeTrajectoryStepsResponse → extract planner response text.
 ///
@@ -126,13 +121,9 @@ pub fn parse_trajectory_steps(buf: &[u8]) -> Vec<TrajectoryStep> {
         let step_type = get_field_typed(&sf, 1, 0)
             .map(|f| f.varint_value)
             .unwrap_or(0);
-        let status = get_field_typed(&sf, 4, 0)
-            .map(|f| f.varint_value)
-            .unwrap_or(0);
 
         let mut entry = TrajectoryStep {
             step_type,
-            status,
             response_text: String::new(),
             modified_text: String::new(),
             text: String::new(),

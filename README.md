@@ -29,13 +29,13 @@ This project was built to unleash the extraordinary potential of *Claude Code*. 
 
 Furthermore, this tool is fortified by a robust plugin ecosystem enabling smooth integration with various third-party services. It comes wrapped in enterprise-grade security and governance features such as anti-destructive guardrails, strict access management, and high-level privacy standards. This makes it an instant, secure, and infinitely more comprehensive plug-and-play solution for industrial scale when compared to rigid open-source alternatives.
 
-Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely interact with 24+ different LLM providers (such as OpenAI, OpenRouter, Groq, DeepSeek, Google Gemini, Ollama, etc.), liberating it from the exclusivity constraints of the Anthropic API.
+Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely interact with 24+ different LLM providers (such as OpenAI, OpenRouter, Windsurf, Groq, DeepSeek, Google Gemini, Ollama, etc.), liberating it from the exclusivity constraints of the Anthropic API.
 
 ## 🎯 Core Features
 
 - **Blazing Fast & Lightweight**: Written in pure Rust using `axum`, boasting near-zero proxy latency and an extremely minimal memory footprint perfect for long-running daemonized processes.
 - **Anthropic ↔ OpenAI Compat API**: Automatically translates Anthropic's complex proprietary API requests (such as `messages`, `system`, `tools`, `thinking`) into standard, universally accepted OpenAI-compatible API requests. It then seamlessly streams the responses back using Anthropic's exact SSE (Server-Sent Events) formatting and event sequences.
-- **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, driven directly by your simple `.env` configuration.
+- **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Windsurf, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, driven directly by your simple `.env` configuration.
 - **Smart 429 Rate Limit Deflection**:
   - Proactive algorithmic sliding window rate limiter that intelligently throttles concurrent bursts *before* provider limits are hit.
   - Reactive blocking with customizable exponential backoff and jitter retries when an HTTP `429` is eventually encountered.
@@ -83,8 +83,8 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
    OPENROUTER_API_KEY=sk-or-v1-yourapikey
    OLLAMA_BASE_URL=http://localhost:11434/v1
 
-   # Optional: enable native Windsurf integration
-   # CODEIUM_AUTH_TOKEN=eyJhbGciOi...
+   # Optional: enable native Windsurf provider integration
+   # CODEIUM_AUTH_TOKEN="ott$$eyJhbGciOi....."
 
    # Optional: compact Claude Code system prompts (enabled by default)
    # ENABLE_RTK=true
@@ -165,8 +165,11 @@ Crustoxy embeds the Windsurf language server binary directly — no external pro
 ### Quick setup
 
 ```bash
-# Set your Codeium auth token (from Windsurf IDE: "Codeium: Show Auth Token")
-CODEIUM_AUTH_TOKEN=eyJhbGciOiJSUzI1Ni...
+# Set your Codeium auth token. 
+# 1. Get it from: https://windsurf.com/show-auth-token (or from Windsurf IDE: "Codeium: Show Auth Token")
+# 2. IMPORTANT: If your token contains a '$' character (which is common), you MUST 
+#    escape it by writing '$$' in your .env file or docker-compose to prevent interpolation errors.
+CODEIUM_AUTH_TOKEN="ott$$eyJhbGciOiJSUzI1Ni..."
 
 # Route any model slot to a Windsurf model
 MODEL=windsurf/claude-sonnet-4

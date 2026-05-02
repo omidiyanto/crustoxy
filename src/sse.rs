@@ -390,6 +390,48 @@ pub fn format_content_delta(text: &str, index: u32) -> String {
     events
 }
 
+pub fn format_block_start(index: u32, block_type: &str) -> String {
+    let content_block = if block_type == "thinking" {
+        json!({"type": "thinking", "thinking": ""})
+    } else {
+        json!({"type": "text", "text": ""})
+    };
+    format_sse(
+        "content_block_start",
+        &json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block
+        }),
+    )
+}
+
+pub fn format_block_delta(index: u32, block_type: &str, delta_text: &str) -> String {
+    let delta = if block_type == "thinking" {
+        json!({"type": "thinking_delta", "thinking": delta_text})
+    } else {
+        json!({"type": "text_delta", "text": delta_text})
+    };
+    format_sse(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": delta
+        }),
+    )
+}
+
+pub fn format_block_stop(index: u32) -> String {
+    format_sse(
+        "content_block_stop",
+        &json!({
+            "type": "content_block_stop",
+            "index": index
+        }),
+    )
+}
+
 pub fn format_message_stop(
     _request_id: &str,
     _model: &str,
