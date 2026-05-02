@@ -62,8 +62,8 @@ pub async fn register_codeium_token(token: &str) -> Result<(String, String), Str
 
     let client = reqwest::Client::new();
 
-    // Browser fingerprint matching WindsurfAPI's generateFingerprint()
-    let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    // User-Agent must match Windsurf client exactly — server rejects browser UAs
+    let ua = "windsurf/1.9600.41";
 
     for (url, source) in [(new_url, "new"), (legacy_url, "legacy")] {
         let res = client
@@ -72,12 +72,8 @@ pub async fn register_codeium_token(token: &str) -> Result<(String, String), Str
             .header("Connect-Protocol-Version", "1")
             .header("Accept", "application/json")
             .header("User-Agent", ua)
-            .header("Sec-Ch-Ua", "\"Google Chrome\";v=\"126\", \"Chromium\";v=\"126\", \"Not.A/Brand\";v=\"8\"")
-            .header("Sec-Ch-Ua-Mobile", "?0")
-            .header("Sec-Ch-Ua-Platform", "\"Windows\"")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "cross-site")
+            .header("Origin", "https://windsurf.com")
+            .header("Referer", "https://windsurf.com/")
             .body(body_str.clone())
             .send()
             .await;
