@@ -447,7 +447,7 @@ impl WindsurfProvider {
         let mut idle_count = 0;
         let mut block_index: u32 = 0;
         let mut active_block: Option<String> = None;
-        let poll_interval = std::time::Duration::from_millis(500);
+        let poll_interval = std::time::Duration::from_millis(50);
         let max_wait = std::time::Duration::from_secs(300);
         let started = std::time::Instant::now();
         let mut last_growth_at = std::time::Instant::now();
