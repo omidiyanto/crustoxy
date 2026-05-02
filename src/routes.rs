@@ -128,7 +128,7 @@ pub async fn create_message(
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": "Windsurf provider not enabled. Set WINDSURF_API_KEY to enable."
+                        "message": "Windsurf provider not enabled. Set CODEIUM_AUTH_TOKEN to enable."
                     }
                 })),
             )

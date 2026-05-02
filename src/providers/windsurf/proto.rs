@@ -73,22 +73,18 @@ pub fn write_string_field(field: u32, s: &str) -> Vec<u8> {
 }
 
 /// Write an embedded message field (wire type 2).
+/// Always emits the field — even for zero-length messages, which is
+/// semantically distinct from "field absent" in protobuf.
 pub fn write_message_field(field: u32, msg: &[u8]) -> Vec<u8> {
-    if msg.is_empty() {
-        return Vec::new();
-    }
     let mut buf = make_tag(field, 2);
     buf.extend(encode_varint(msg.len() as u64));
     buf.extend(msg);
     buf
 }
 
-/// Write a bool field (wire type 0), only if true.
+/// Write a bool field (wire type 0). Emits both true and false.
 pub fn write_bool_field(field: u32, value: bool) -> Vec<u8> {
-    if !value {
-        return Vec::new();
-    }
-    write_varint_field(field, 1)
+    write_varint_field(field, if value { 1 } else { 0 })
 }
 
 // ─── Parser ────────────────────────────────────────────

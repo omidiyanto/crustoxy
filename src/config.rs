@@ -163,12 +163,12 @@ pub struct Settings {
     // RTK token optimization
     pub enable_rtk: bool,
     pub override_system_prompt: Option<String>,
-    // Windsurf provider (auto-enabled when windsurf_api_key or codeium_auth_token is set)
-    pub windsurf_api_key: Option<String>,
+    // Windsurf provider (auto-enabled when codeium_auth_token is set)
     pub codeium_auth_token: Option<String>,
     pub windsurf_ls_path: String,
     pub windsurf_ls_port: u16,
     pub windsurf_api_server_url: String,
+    pub windsurf_data_dir: String,
 }
 
 impl Settings {
@@ -206,7 +206,6 @@ impl Settings {
             tool_retry_max: env_or("TOOL_RETRY_MAX", "2").parse().unwrap_or(2),
             enable_rtk: env_or("ENABLE_RTK", "true").parse().unwrap_or(true),
             override_system_prompt: env_or_none("OVERRIDE_SYSTEM_PROMPT"),
-            windsurf_api_key: env_or_none("WINDSURF_API_KEY"),
             codeium_auth_token: env_or_none("CODEIUM_AUTH_TOKEN"),
             windsurf_ls_path: env_or(
                 "WINDSURF_LS_PATH",
@@ -217,6 +216,7 @@ impl Settings {
                 "WINDSURF_API_SERVER_URL",
                 "https://server.self-serve.windsurf.com",
             ),
+            windsurf_data_dir: env_or("WINDSURF_DATA_DIR", "/opt/windsurf/data"),
         }
     }
 

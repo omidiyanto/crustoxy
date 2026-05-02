@@ -2,7 +2,8 @@
 //!
 //! Service: exa.language_server_pb.LanguageServerService
 //!
-//! Ported from WindsurfAPI/src/windsurf.js
+//! Faithfully ported from WindsurfAPI/src/windsurf.js — field numbers and
+//! nesting structure MUST match exactly or the LS binary will reject/ignore.
 
 use uuid::Uuid;
 
@@ -29,6 +30,7 @@ fn encode_timestamp() -> Vec<u8> {
 }
 
 // ─── Metadata ──────────────────────────────────────────
+// Matches WindsurfAPI/src/windsurf.js buildMetadata()
 
 const DEFAULT_CLIENT_VERSION: &str = "2.0.67";
 
@@ -145,8 +147,10 @@ pub fn build_raw_get_chat_message_request(
 }
 
 // ─── Panel initialization ─────────────────────────────
+// Matches WindsurfAPI/src/windsurf.js
 
 /// Build InitializeCascadePanelStateRequest.
+/// Field 1: metadata, Field 3: workspace_trusted (bool)
 pub fn build_initialize_panel_state_request(api_key: &str, session_id: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend(write_message_field(1, &build_metadata(api_key, session_id)));
@@ -154,17 +158,18 @@ pub fn build_initialize_panel_state_request(api_key: &str, session_id: &str) -> 
     buf
 }
 
-/// Build HeartbeatRequest.
+/// Build HeartbeatRequest. Field 1: metadata
 pub fn build_heartbeat_request(api_key: &str, session_id: &str) -> Vec<u8> {
     write_message_field(1, &build_metadata(api_key, session_id))
 }
 
-/// Build AddTrackedWorkspaceRequest.
+/// Build AddTrackedWorkspaceRequest. Field 1: workspace path (string)
 pub fn build_add_tracked_workspace_request(workspace_path: &str) -> Vec<u8> {
     write_string_field(1, workspace_path)
 }
 
 /// Build UpdateWorkspaceTrustRequest.
+/// Field 1: metadata, Field 2: workspace_trusted (bool)
 pub fn build_update_workspace_trust_request(api_key: &str, session_id: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend(write_message_field(1, &build_metadata(api_key, session_id)));
@@ -175,6 +180,7 @@ pub fn build_update_workspace_trust_request(api_key: &str, session_id: &str) -> 
 // ─── Cascade flow builders ─────────────────────────────
 
 /// Build StartCascadeRequest.
+/// Field 1: metadata, Field 4: source (1=CASCADE_CLIENT), Field 5: trajectory_type (1=USER_MAINLINE)
 pub fn build_start_cascade_request(api_key: &str, session_id: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend(write_message_field(1, &build_metadata(api_key, session_id)));
@@ -184,6 +190,12 @@ pub fn build_start_cascade_request(api_key: &str, session_id: &str) -> Vec<u8> {
 }
 
 /// Build SendUserCascadeMessageRequest.
+///
+/// Matches WindsurfAPI/src/windsurf.js buildSendCascadeMessageRequest():
+///   Field 1: cascade_id
+///   Field 2: TextOrScopeItem { text = 1 }
+///   Field 3: metadata
+///   Field 5: cascade_config
 pub fn build_send_cascade_message_request(
     api_key: &str,
     cascade_id: &str,
@@ -203,31 +215,62 @@ pub fn build_send_cascade_message_request(
     // Field 3: metadata
     parts.extend(write_message_field(3, &build_metadata(api_key, session_id)));
 
-    // Field 5: cascade_config
+    // Field 5: cascade_config — the critical nested structure
     let cascade_config = build_cascade_config(model_enum, model_uid);
     parts.extend(write_message_field(5, &cascade_config));
 
     parts
 }
 
+/// Build CascadeConfig — the OUTER wrapper.
+///
+/// This is the most critical structure. It MUST match WindsurfAPI exactly:
+///
+/// ```text
+/// CascadeConfig {
+///   field 1: CascadePlannerConfig { ... }
+///   field 5: MemoryConfig { enabled = false }
+///   field 7: BrainConfig { ... }
+/// }
+/// ```
 fn build_cascade_config(model_enum: u64, model_uid: &str) -> Vec<u8> {
+    // ── Build CascadeConversationalPlannerConfig (inner) ──
     // planner_mode: NO_TOOL(3) — avoid Cascade's built-in tools
-    let mut conv_parts = write_varint_field(4, 3);
+    let mut conv_parts = write_varint_field(4, 3); // planner_mode = NO_TOOL
 
     // field 10 (tool_calling_section): suppress built-in tool list
     let no_tool_section = {
-        let mut s = write_varint_field(1, 1); // OVERRIDE mode
+        let mut s = write_varint_field(1, 1); // SECTION_OVERRIDE_MODE_OVERRIDE
         s.extend(write_string_field(2, "No tools are available."));
         s
     };
     conv_parts.extend(write_message_field(10, &no_tool_section));
 
-    // field 12 (additional_instructions): direct-answer mode
+    // field 12 (additional_instructions_section): direct-answer mode
+    // This matches WindsurfAPI's comprehensive no-tool instructions
     let instructions_section = {
         let mut s = write_varint_field(1, 1); // OVERRIDE mode
         s.extend(write_string_field(
             2,
-            "Answer the user directly. Do not attempt to use IDE tools or modify files.",
+            concat!(
+                "CRITICAL OPERATING CONSTRAINT — READ BEFORE ANY RESPONSE:\n",
+                "You are being accessed as a plain chat API. You have NO tools, NO file access, ",
+                "NO shell, NO code execution, NO repository awareness, NO ability to list or read ",
+                "anything on the user's machine or any sandbox. You cannot \"check\", \"look at\", ",
+                "\"open\", \"view\", \"inspect\", \"run\", \"glob\", \"grep\", \"list\", or \"edit\" anything.\n",
+                "\n",
+                "OUTPUT RULES:\n",
+                "1. Never narrate tool-like actions (\"Let me check X\", \"I'll look at Y\").\n",
+                "2. Never reference file paths, directory structures, line numbers, or repository ",
+                "contents that were not explicitly pasted into the current conversation by the user.\n",
+                "3. If the user asks about their code but hasn't pasted the relevant file content, ",
+                "respond: \"I don't see that file in our conversation — please paste it and I'll help.\"\n",
+                "4. For general questions, answer directly from your training knowledge.\n",
+                "5. Match the user's language.\n",
+                "\n",
+                "Violating these rules will produce broken output for the end user. ",
+                "Stay in chat-API mode at all times."
+            ),
         ));
         s
     };
@@ -244,23 +287,65 @@ fn build_cascade_config(model_enum: u64, model_uid: &str) -> Vec<u8> {
     };
     conv_parts.extend(write_message_field(13, &comm_section));
 
-    // Wrap in CascadeConfig
-    let mut config = Vec::new();
-    // field 1: model_enum
-    if model_enum > 0 {
-        config.extend(write_varint_field(1, model_enum));
-    }
-    // field 2: model_uid
+    let conversational_config = conv_parts;
+
+    // ── Build CascadePlannerConfig (wraps conversational config) ──
+    let mut planner_parts = Vec::new();
+
+    // field 2: CascadeConversationalPlannerConfig
+    planner_parts.extend(write_message_field(2, &conversational_config));
+
+    // Set BOTH modern uid (field 35) AND deprecated enum (field 15)
+    // WindsurfAPI sets both for compatibility with different account states
     if !model_uid.is_empty() {
-        config.extend(write_string_field(2, model_uid));
+        planner_parts.extend(write_string_field(35, model_uid)); // requested_model_uid
+        planner_parts.extend(write_string_field(34, model_uid)); // plan_model_uid (safety)
     }
-    // field 3: conversational_planner_config
-    config.extend(write_message_field(3, &conv_parts));
+    if model_enum > 0 {
+        // requested_model_deprecated = ModelOrAlias { model = 1 (enum) }
+        planner_parts.extend(write_message_field(15, &write_varint_field(1, model_enum)));
+        // plan_model_deprecated = Model (enum directly at field 1)
+        planner_parts.extend(write_varint_field(1, model_enum));
+    }
+
+    // field 6: max_output_tokens — CRITICAL! Without this, responses get truncated
+    planner_parts.extend(write_varint_field(6, 32768));
+
+    // field 11: code_changes_section — suppress IDE-specific boilerplate
+    let empty_section = {
+        let mut s = write_varint_field(1, 1); // OVERRIDE mode
+        s.extend(write_string_field(2, ""));
+        s
+    };
+    planner_parts.extend(write_message_field(11, &empty_section));
+
+    let planner_config = planner_parts;
+
+    // ── Build BrainConfig ──
+    // Matches: writeMessageField(7, writeMessageField(6, writeMessageField(6, Buffer.alloc(0))))
+    let brain_inner = write_message_field(6, &[]); // empty inner
+    let brain_mid = write_message_field(6, &brain_inner);
+    let brain_config = {
+        let mut b = write_varint_field(1, 1);
+        b.extend(brain_mid);
+        b
+    };
+
+    // ── Build MemoryConfig ──
+    // Matches: { enabled = false } — prevents LS injecting stored memories
+    let memory_config = write_bool_field(1, false);
+
+    // ── Assemble CascadeConfig ──
+    let mut config = Vec::new();
+    config.extend(write_message_field(1, &planner_config)); // field 1: planner config
+    config.extend(write_message_field(5, &memory_config)); // field 5: memory config
+    config.extend(write_message_field(7, &brain_config)); // field 7: brain config
 
     config
 }
 
 /// Build GetCascadeTrajectoryStepsRequest.
+/// Field 1: cascade_id, Field 2: step_offset
 pub fn build_get_trajectory_steps_request(cascade_id: &str, step_offset: u64) -> Vec<u8> {
     let mut parts = write_string_field(1, cascade_id);
     if step_offset > 0 {
@@ -270,6 +355,7 @@ pub fn build_get_trajectory_steps_request(cascade_id: &str, step_offset: u64) ->
 }
 
 /// Build GetCascadeTrajectoryRequest.
+/// Field 1: cascade_id
 pub fn build_get_trajectory_request(cascade_id: &str) -> Vec<u8> {
     write_string_field(1, cascade_id)
 }

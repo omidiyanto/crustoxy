@@ -48,40 +48,31 @@ async fn main() {
     let provider = OpenAICompatProvider::new(&settings);
 
     // Conditional Windsurf provider initialization
-    let windsurf_provider =
-        if settings.windsurf_api_key.is_some() || settings.codeium_auth_token.is_some() {
-            let auth_source = if settings.windsurf_api_key.is_some() {
-                "WINDSURF_API_KEY"
-            } else {
-                "CODEIUM_AUTH_TOKEN"
-            };
-            info!(
-                "{} detected, initializing Windsurf provider...",
-                auth_source
-            );
-            match providers::WindsurfProvider::new(
-                settings.windsurf_api_key.as_deref(),
-                settings.codeium_auth_token.as_deref(),
-                &settings.windsurf_ls_path,
-                settings.windsurf_ls_port,
-                &settings.windsurf_api_server_url,
-            )
-            .await
-            {
-                Ok(wp) => {
-                    info!("Windsurf provider ready");
-                    Some(Arc::new(wp))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to initialize Windsurf provider: {}", e);
-                    info!("Continuing without Windsurf provider");
-                    None
-                }
+    let windsurf_provider = if let Some(ref auth_token) = settings.codeium_auth_token {
+        info!("CODEIUM_AUTH_TOKEN detected, initializing Windsurf provider...");
+        match providers::WindsurfProvider::new(
+            auth_token,
+            &settings.windsurf_ls_path,
+            settings.windsurf_ls_port,
+            &settings.windsurf_api_server_url,
+            &settings.windsurf_data_dir,
+        )
+        .await
+        {
+            Ok(wp) => {
+                info!("Windsurf provider ready");
+                Some(Arc::new(wp))
             }
-        } else {
-            info!("Windsurf provider disabled (WINDSURF_API_KEY and CODEIUM_AUTH_TOKEN not set)");
-            None
-        };
+            Err(e) => {
+                tracing::error!("Failed to initialize Windsurf provider: {}", e);
+                info!("Continuing without Windsurf provider");
+                None
+            }
+        }
+    } else {
+        info!("Windsurf provider disabled (CODEIUM_AUTH_TOKEN not set)");
+        None
+    };
 
     let state = Arc::new(AppState {
         settings: settings.clone(),

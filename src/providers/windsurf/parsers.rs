@@ -1,6 +1,6 @@
 //! Response parsers for Windsurf language server protobuf messages.
 //!
-//! Ported from WindsurfAPI/src/windsurf.js
+//! Faithfully ported from WindsurfAPI/src/windsurf.js
 
 use super::proto::*;
 
@@ -88,6 +88,11 @@ pub fn parse_trajectory_status(buf: &[u8]) -> TrajectoryStatus {
 pub struct TrajectoryStep {
     pub step_type: u64,
     pub status: u64,
+    /// Raw response text (field 1 of planner_response) — append-only during streaming.
+    pub response_text: String,
+    /// Modified response text (field 8 of planner_response) — LS post-pass rewrite.
+    pub modified_text: String,
+    /// Best text: prefer response_text during streaming, modified_text at end.
     pub text: String,
     pub thinking: String,
     pub error_text: String,
@@ -95,12 +100,20 @@ pub struct TrajectoryStep {
 
 /// Step type constants.
 pub const STEP_TYPE_PLANNER_RESPONSE: u64 = 15;
+/// Error step type — indicates the cascade refused the request.
+pub const STEP_TYPE_ERROR_MESSAGE: u64 = 17;
 
 /// Step status constants.
 pub const STEP_STATUS_DONE: u64 = 3;
 pub const STEP_STATUS_GENERATING: u64 = 8;
 
 /// Parse GetCascadeTrajectoryStepsResponse → extract planner response text.
+///
+/// Matches WindsurfAPI/src/windsurf.js parseTrajectorySteps():
+///   Field 1: repeated CortexTrajectoryStep
+///     Step.field 1:  type (enum, 15=PLANNER_RESPONSE, 17=ERROR_MESSAGE)
+///     Step.field 4:  status (enum, 3=DONE, 8=GENERATING)
+///     Step.field 20: planner_response { field 1: response, field 3: thinking, field 8: modified_response }
 pub fn parse_trajectory_steps(buf: &[u8]) -> Vec<TrajectoryStep> {
     let fields = parse_fields(buf);
     let steps: Vec<&ProtoField> = get_all_fields(&fields, 1)
@@ -122,6 +135,8 @@ pub fn parse_trajectory_steps(buf: &[u8]) -> Vec<TrajectoryStep> {
         let mut entry = TrajectoryStep {
             step_type,
             status,
+            response_text: String::new(),
+            modified_text: String::new(),
             text: String::new(),
             thinking: String::new(),
             error_text: String::new(),
@@ -131,19 +146,24 @@ pub fn parse_trajectory_steps(buf: &[u8]) -> Vec<TrajectoryStep> {
         if let Some(planner_field) = get_field_typed(&sf, 20, 2) {
             let pf = parse_fields(&planner_field.bytes_value);
 
-            // response = field 1, modified_response = field 8
+            // response = field 1 (append-only stream text)
             let response_text = get_field_typed(&pf, 1, 2)
                 .map(|f| f.as_string())
                 .unwrap_or_default();
+            // modified_response = field 8 (LS post-pass rewrite)
             let modified_text = get_field_typed(&pf, 8, 2)
                 .map(|f| f.as_string())
                 .unwrap_or_default();
 
-            // Prefer modified_response when present
-            entry.text = if !modified_text.is_empty() {
-                modified_text
-            } else {
+            entry.response_text = response_text.clone();
+            entry.modified_text = modified_text.clone();
+
+            // During streaming, prefer response_text (monotonic).
+            // At final sweep, caller should check modified_text.
+            entry.text = if !response_text.is_empty() {
                 response_text
+            } else {
+                modified_text
             };
 
             // thinking = field 3
@@ -152,8 +172,26 @@ pub fn parse_trajectory_steps(buf: &[u8]) -> Vec<TrajectoryStep> {
             }
         }
 
+        // Error info: check for error step type first
+        if step_type == STEP_TYPE_ERROR_MESSAGE {
+            // Error text from planner_response or direct fields
+            if entry.text.is_empty() {
+                // Try field 20 response as error text
+                if let Some(pf) = get_field_typed(&sf, 20, 2) {
+                    let inner = parse_fields(&pf.bytes_value);
+                    if let Some(f) = get_field_typed(&inner, 1, 2) {
+                        entry.error_text = f.as_string();
+                    }
+                }
+            } else {
+                entry.error_text = entry.text.clone();
+            }
+        }
+
         // Error info: field 24 (error_message) or field 31 (error)
-        if let Some(err_field) = get_field_typed(&sf, 24, 2) {
+        if entry.error_text.is_empty()
+            && let Some(err_field) = get_field_typed(&sf, 24, 2)
+        {
             let inner = parse_fields(&err_field.bytes_value);
             if let Some(details) = get_field_typed(&inner, 3, 2) {
                 entry.error_text = read_error_details(&details.bytes_value);
