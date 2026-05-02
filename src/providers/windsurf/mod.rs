@@ -49,8 +49,9 @@ pub struct WindsurfProvider {
     workspace_initialized: Arc<Mutex<bool>>,
 }
 
-/// Exchange a Codeium auth token (Firebase ID token) for a Windsurf API key.
+/// Exchange a Codeium auth token (Firebase ID token or show-auth-token OTT) for a Windsurf API key.
 /// Tries register.windsurf.com first, falls back to api.codeium.com.
+/// Includes browser fingerprint headers to match WindsurfAPI request signature.
 pub async fn register_codeium_token(token: &str) -> Result<(String, String), String> {
     let body = serde_json::json!({ "firebase_id_token": token });
     let body_str = body.to_string();
@@ -61,13 +62,22 @@ pub async fn register_codeium_token(token: &str) -> Result<(String, String), Str
 
     let client = reqwest::Client::new();
 
+    // Browser fingerprint matching WindsurfAPI's generateFingerprint()
+    let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
     for (url, source) in [(new_url, "new"), (legacy_url, "legacy")] {
         let res = client
             .post(url)
             .header("Content-Type", "application/json")
             .header("Connect-Protocol-Version", "1")
             .header("Accept", "application/json")
-            .header("User-Agent", "windsurf/1.9600.41")
+            .header("User-Agent", ua)
+            .header("Sec-Ch-Ua", "\"Google Chrome\";v=\"126\", \"Chromium\";v=\"126\", \"Not.A/Brand\";v=\"8\"")
+            .header("Sec-Ch-Ua-Mobile", "?0")
+            .header("Sec-Ch-Ua-Platform", "\"Windows\"")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "cross-site")
             .body(body_str.clone())
             .send()
             .await;
