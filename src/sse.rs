@@ -320,3 +320,105 @@ impl SSEBuilder {
         self.blocks.text_index >= 0 || !self.blocks.tool_states.is_empty()
     }
 }
+
+// ─── Standalone formatting helpers (for providers that manage their own stream) ──
+
+fn format_sse(event_type: &str, data: &Value) -> String {
+    format!(
+        "event: {}\ndata: {}\n\n",
+        event_type,
+        serde_json::to_string(data).unwrap()
+    )
+}
+
+pub fn format_message_start(request_id: &str, model: &str, input_tokens: u32) -> String {
+    format_sse(
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": request_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 1
+                }
+            }
+        }),
+    )
+}
+
+pub fn format_content_delta(text: &str, index: u32) -> String {
+    let mut events = String::new();
+
+    // Emit content_block_start if this is the first delta (index 0 convention)
+    if index == 0 {
+        // We always emit as a text block start + delta pair per chunk.
+        // The caller is expected to emit block_start once; subsequent calls
+        // only emit deltas. For simplicity, we combine start+delta here.
+    }
+
+    events.push_str(&format_sse(
+        "content_block_start",
+        &json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""}
+        }),
+    ));
+    events.push_str(&format_sse(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    ));
+    events.push_str(&format_sse(
+        "content_block_stop",
+        &json!({
+            "type": "content_block_stop",
+            "index": 0
+        }),
+    ));
+
+    events
+}
+
+pub fn format_message_stop(
+    _request_id: &str,
+    _model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    stop_reason: &str,
+) -> String {
+    let mut events = String::new();
+    events.push_str(&format_sse(
+        "message_delta",
+        &json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+        }),
+    ));
+    events.push_str(&format_sse(
+        "message_stop",
+        &json!({"type": "message_stop"}),
+    ));
+    events
+}
+
+pub fn format_error_event(error_message: &str, error_type: &str) -> String {
+    format_sse(
+        "error",
+        &json!({
+            "type": "error",
+            "error": {"type": error_type, "message": error_message}
+        }),
+    )
+}

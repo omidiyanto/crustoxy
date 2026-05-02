@@ -8,6 +8,7 @@ mod optimization;
 mod providers;
 mod rate_limiter;
 mod routes;
+mod rtk;
 mod sse;
 mod think_parser;
 mod tool_intent_detector;
@@ -46,10 +47,49 @@ async fn main() {
     let settings = Settings::from_env();
     let provider = OpenAICompatProvider::new(&settings);
 
+    // Conditional Windsurf provider initialization
+    let windsurf_provider =
+        if settings.windsurf_api_key.is_some() || settings.codeium_auth_token.is_some() {
+            let auth_source = if settings.windsurf_api_key.is_some() {
+                "WINDSURF_API_KEY"
+            } else {
+                "CODEIUM_AUTH_TOKEN"
+            };
+            info!(
+                "{} detected, initializing Windsurf provider...",
+                auth_source
+            );
+            match providers::WindsurfProvider::new(
+                settings.windsurf_api_key.as_deref(),
+                settings.codeium_auth_token.as_deref(),
+                &settings.windsurf_ls_path,
+                settings.windsurf_ls_port,
+                &settings.windsurf_api_server_url,
+            )
+            .await
+            {
+                Ok(wp) => {
+                    info!("Windsurf provider ready");
+                    Some(Arc::new(wp))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize Windsurf provider: {}", e);
+                    info!("Continuing without Windsurf provider");
+                    None
+                }
+            }
+        } else {
+            info!("Windsurf provider disabled (WINDSURF_API_KEY and CODEIUM_AUTH_TOKEN not set)");
+            None
+        };
+
     let state = Arc::new(AppState {
         settings: settings.clone(),
         provider,
+        windsurf_provider,
     });
+
+    let shutdown_state = state.clone();
 
     let app = Router::new()
         .route("/v1/messages", post(routes::create_message))
@@ -71,5 +111,15 @@ async fn main() {
     );
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Received shutdown signal");
+            if let Some(ref ws) = shutdown_state.windsurf_provider {
+                ws.shutdown().await;
+                info!("Windsurf provider shut down");
+            }
+        })
+        .await
+        .unwrap();
 }
