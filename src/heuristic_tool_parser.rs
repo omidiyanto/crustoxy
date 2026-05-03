@@ -44,6 +44,10 @@ static FUNC_START_RE: LazyLock<Regex> =
 static PARAM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)<parameter=([^>]+)>(.*?)(?:</parameter>|$)").unwrap());
 
+/// Pattern for `functions.Name:N{json_args}` format used by some models.
+static FUNCTIONS_CALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"functions\.(\w+):\d+(\{[\s\S]*\})").unwrap());
+
 impl HeuristicToolParser {
     pub fn new() -> Self {
         Self {
@@ -72,11 +76,58 @@ impl HeuristicToolParser {
         loop {
             match self.state {
                 ParserState::Text => {
-                    if let Some(idx) = self.buffer.find('●') {
+                    // Check for `functions.Name:N{json}` pattern first
+                    if let Some(caps) = FUNCTIONS_CALL_RE.captures(&self.buffer) {
+                        let full_match = caps.get(0).unwrap();
+                        let func_name = caps[1].to_string();
+                        let json_str = caps[2].to_string();
+
+                        // Emit text before the match
+                        let before = self.buffer[..full_match.start()].to_string();
+                        if !before.is_empty() {
+                            filtered_parts.push(before);
+                        }
+
+                        // Parse JSON arguments into input map
+                        let mut input = HashMap::new();
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&json_str)
+                            && let Some(obj) = parsed.as_object()
+                        {
+                            for (k, v) in obj {
+                                let val = match v {
+                                    Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                input.insert(k.clone(), val);
+                            }
+                        }
+
+                        detected_tools.push(DetectedTool {
+                            id: format!("toolu_heuristic_{}", &Uuid::new_v4().to_string()[..8]),
+                            name: func_name,
+                            input,
+                        });
+
+                        self.buffer = self.buffer[full_match.end()..].to_string();
+                        continue;
+                    } else if let Some(idx) = self.buffer.find('●') {
                         filtered_parts.push(self.buffer[..idx].to_string());
                         self.buffer = self.buffer[idx..].to_string();
                         self.state = ParserState::MatchingFunction;
                     } else {
+                        // Check for incomplete `functions.` at end of buffer
+                        if let Some(start) = self.buffer.rfind("functions.") {
+                            let tail = &self.buffer[start..];
+                            // If it doesn't contain a closing `}`, it may be incomplete
+                            if !tail.contains('}') {
+                                let safe = self.buffer[..start].to_string();
+                                self.buffer = self.buffer[start..].to_string();
+                                if !safe.is_empty() {
+                                    filtered_parts.push(safe);
+                                }
+                                break;
+                            }
+                        }
                         // Check for incomplete control token at end
                         if let Some(start) = self.buffer.rfind(CONTROL_TOKEN_START) {
                             let tail = &self.buffer[start..];
@@ -179,6 +230,32 @@ impl HeuristicToolParser {
                 input: self.current_parameters.clone(),
             });
             self.state = ParserState::Text;
+            self.buffer.clear();
+        }
+
+        // Check for any remaining `functions.Name:N{json}` in buffer
+        if !self.buffer.is_empty()
+            && let Some(caps) = FUNCTIONS_CALL_RE.captures(&self.buffer)
+        {
+            let func_name = caps[1].to_string();
+            let json_str = caps[2].to_string();
+            let mut input = HashMap::new();
+            if let Ok(parsed) = serde_json::from_str::<Value>(&json_str)
+                && let Some(obj) = parsed.as_object()
+            {
+                for (k, v) in obj {
+                    let val = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    input.insert(k.clone(), val);
+                }
+            }
+            detected.push(DetectedTool {
+                id: format!("toolu_heuristic_{}", &Uuid::new_v4().to_string()[..8]),
+                name: func_name,
+                input,
+            });
             self.buffer.clear();
         }
 
