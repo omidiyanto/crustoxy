@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::config::Settings;
 use crate::converter::build_openai_request;
+use crate::heuristic_tool_parser::HeuristicToolParser;
 use crate::models::anthropic::MessagesRequest;
 use crate::sse::SSEBuilder;
 use crate::think_parser::{ContentType, ThinkTagParser};
@@ -372,6 +373,8 @@ impl PuterProvider {
                         // {"type": "reasoning", "reasoning": "..."} for thinking
                         // {"type": "text", "text": "..."} for text content
                         let mut think_parser = ThinkTagParser::new();
+                        let mut heuristic_parser = HeuristicToolParser::new();
+                        let mut had_tool_call = false;
                         let mut byte_stream = response.bytes_stream();
                         let mut line_buffer = String::new();
 
@@ -430,10 +433,44 @@ impl PuterProvider {
                                                         yield sse.emit_thinking_delta(&c.content);
                                                     }
                                                     ContentType::Text => {
-                                                        for event in sse.ensure_text_block() {
-                                                            yield event;
+                                                        // Run heuristic tool parser on text
+                                                        let (filtered_text, detected_tools) =
+                                                            heuristic_parser.feed(&c.content);
+
+                                                        if !filtered_text.is_empty() {
+                                                            for event in sse.ensure_text_block() {
+                                                                yield event;
+                                                            }
+                                                            yield sse.emit_text_delta(&filtered_text);
                                                         }
-                                                        yield sse.emit_text_delta(&c.content);
+
+                                                        for tool_use in &detected_tools {
+                                                            had_tool_call = true;
+                                                            for event in sse.close_content_blocks() {
+                                                                yield event;
+                                                            }
+                                                            let block_idx = sse.blocks.allocate_index();
+                                                            let mut input = tool_use.input.clone();
+                                                            if tool_use.name == "Task" {
+                                                                input.insert(
+                                                                    "run_in_background".to_string(),
+                                                                    "false".to_string(),
+                                                                );
+                                                            }
+                                                            let input_json = serde_json::to_string(&input)
+                                                                .unwrap_or_else(|_| "{}".to_string());
+                                                            yield sse.content_block_start(
+                                                                block_idx,
+                                                                "tool_use",
+                                                                json!({"id": tool_use.id, "name": tool_use.name}),
+                                                            );
+                                                            yield sse.content_block_delta(
+                                                                block_idx,
+                                                                "input_json_delta",
+                                                                &input_json,
+                                                            );
+                                                            yield sse.content_block_stop(block_idx);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -516,6 +553,32 @@ impl PuterProvider {
                             }
                         }
 
+                        // Flush heuristic tool parser
+                        for tool_use in heuristic_parser.flush() {
+                            had_tool_call = true;
+                            for event in sse.close_content_blocks() {
+                                yield event;
+                            }
+                            let block_idx = sse.blocks.allocate_index();
+                            let mut input = tool_use.input.clone();
+                            if tool_use.name == "Task" {
+                                input.insert("run_in_background".to_string(), "false".to_string());
+                            }
+                            let input_json = serde_json::to_string(&input)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            yield sse.content_block_start(
+                                block_idx,
+                                "tool_use",
+                                json!({"id": tool_use.id, "name": tool_use.name}),
+                            );
+                            yield sse.content_block_delta(
+                                block_idx,
+                                "input_json_delta",
+                                &input_json,
+                            );
+                            yield sse.content_block_stop(block_idx);
+                        }
+
                         // Flush think parser
                         if let Some(remaining) = think_parser.flush() {
                             match remaining.content_type {
@@ -547,7 +610,8 @@ impl PuterProvider {
                         }
 
                         let output_tokens = sse.estimate_output_tokens();
-                        yield sse.message_delta("end_turn", output_tokens);
+                        let stop_reason = if had_tool_call { "tool_use" } else { "end_turn" };
+                        yield sse.message_delta(stop_reason, output_tokens);
                         yield sse.message_stop();
                         return;
                     }
@@ -677,6 +741,7 @@ impl PuterProvider {
         {
             // Parse out any inline <think> tags
             let mut think_parser = ThinkTagParser::new();
+            let mut heuristic_parser = HeuristicToolParser::new();
             let chunks = think_parser.feed(text_content);
             let mut text_parts = Vec::new();
 
@@ -686,7 +751,28 @@ impl PuterProvider {
                         content_blocks.push(json!({"type": "thinking", "thinking": c.content}));
                     }
                     ContentType::Text => {
-                        text_parts.push(c.content);
+                        let (filtered, tools) = heuristic_parser.feed(&c.content);
+                        if !filtered.is_empty() {
+                            text_parts.push(filtered);
+                        }
+                        for tool_use in &tools {
+                            // Flush accumulated text before tool block
+                            let combined = text_parts.join("");
+                            if !combined.is_empty() {
+                                content_blocks.push(json!({"type": "text", "text": combined}));
+                                text_parts.clear();
+                            }
+                            let mut input_map = serde_json::Map::new();
+                            for (k, v) in &tool_use.input {
+                                input_map.insert(k.clone(), Value::String(v.clone()));
+                            }
+                            content_blocks.push(json!({
+                                "type": "tool_use",
+                                "id": tool_use.id,
+                                "name": tool_use.name,
+                                "input": input_map
+                            }));
+                        }
                     }
                 }
             }
@@ -698,9 +784,31 @@ impl PuterProvider {
                             .push(json!({"type": "thinking", "thinking": remaining.content}));
                     }
                     ContentType::Text => {
-                        text_parts.push(remaining.content);
+                        let (filtered, _) = heuristic_parser.feed(&remaining.content);
+                        if !filtered.is_empty() {
+                            text_parts.push(filtered);
+                        }
                     }
                 }
+            }
+
+            // Flush remaining heuristic tools
+            for tool_use in heuristic_parser.flush() {
+                let combined = text_parts.join("");
+                if !combined.is_empty() {
+                    content_blocks.push(json!({"type": "text", "text": combined}));
+                    text_parts.clear();
+                }
+                let mut input_map = serde_json::Map::new();
+                for (k, v) in &tool_use.input {
+                    input_map.insert(k.clone(), Value::String(v.clone()));
+                }
+                content_blocks.push(json!({
+                    "type": "tool_use",
+                    "id": tool_use.id,
+                    "name": tool_use.name,
+                    "input": input_map
+                }));
             }
 
             let combined_text = text_parts.join("");
@@ -713,6 +821,10 @@ impl PuterProvider {
             content_blocks.push(json!({"type": "text", "text": " "}));
         }
 
+        let has_tool = content_blocks
+            .iter()
+            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"));
+        let stop_reason = if has_tool { "tool_use" } else { "end_turn" };
         let output_tokens = text.map(|t| (t.len() as u32 / 4).max(1)).unwrap_or(1);
 
         Ok(json!({
@@ -721,7 +833,7 @@ impl PuterProvider {
             "role": "assistant",
             "model": request.model,
             "content": content_blocks,
-            "stop_reason": "end_turn",
+            "stop_reason": stop_reason,
             "stop_sequence": null,
             "usage": {
                 "input_tokens": input_tokens,
