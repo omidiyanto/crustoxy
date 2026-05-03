@@ -20,6 +20,8 @@ const CHAT_URL: &str = "https://api.puter.com/drivers/call";
 
 // Token refresh interval: 23 hours (Puter tokens typically expire in ~24h)
 const TOKEN_LIFETIME_SECS: u64 = 23 * 3600;
+const LOGIN_MAX_RETRIES: u32 = 3;
+const LOGIN_BASE_DELAY_MS: u64 = 2000;
 
 struct CachedToken {
     token: String,
@@ -53,8 +55,8 @@ impl PuterProvider {
             cached_token: Arc::new(RwLock::new(None)),
         };
 
-        // Perform initial login
-        provider.ensure_token().await?;
+        // Lazy login: defer to first request so WARP/network has time to initialize
+        info!("Puter provider created (login deferred to first request)");
         Ok(provider)
     }
 
@@ -86,50 +88,87 @@ impl PuterProvider {
         Ok(token)
     }
 
-    /// Perform login to Puter and return a fresh token.
+    /// Perform login to Puter with retry and exponential backoff.
     async fn login(&self) -> Result<String, String> {
-        info!("Puter: logging in as '{}'...", self.username);
+        let mut last_err = String::new();
 
-        let payload = json!({
-            "username": self.username,
-            "password": self.password,
-        });
+        for attempt in 1..=LOGIN_MAX_RETRIES {
+            info!(
+                "Puter: login attempt {}/{} as '{}'...",
+                attempt, LOGIN_MAX_RETRIES, self.username
+            );
 
-        let response = self
-            .client
-            .post(LOGIN_URL)
-            .header("Content-Type", "application/json")
-            .header("Origin", "https://puter.com")
-            .header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-            )
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("Puter login request failed: {}", e))?;
+            let payload = json!({
+                "username": self.username,
+                "password": self.password,
+            });
 
-        let status = response.status().as_u16();
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Puter login response parse error: {}", e))?;
+            let result = self
+                .client
+                .post(LOGIN_URL)
+                .header("Content-Type", "application/json")
+                .header("Origin", "https://puter.com")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
+                )
+                .json(&payload)
+                .send()
+                .await;
 
-        if status >= 400 {
-            let msg = body
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown error");
-            return Err(format!("Puter login failed ({}): {}", status, msg));
+            match result {
+                Err(e) => {
+                    last_err = format!("Puter login request failed: {}", e);
+                    warn!(
+                        "Puter login attempt {}/{} failed: {}",
+                        attempt, LOGIN_MAX_RETRIES, last_err
+                    );
+                }
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let body: Value = response
+                        .json()
+                        .await
+                        .map_err(|e| format!("Puter login response parse error: {}", e))?;
+
+                    if status >= 400 {
+                        let msg = body
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Unknown error");
+                        last_err = format!("Puter login failed ({}): {}", status, msg);
+                        // Don't retry on 401/403 (bad credentials)
+                        if status == 401 || status == 403 {
+                            return Err(last_err);
+                        }
+                        warn!(
+                            "Puter login attempt {}/{} failed: {}",
+                            attempt, LOGIN_MAX_RETRIES, last_err
+                        );
+                    } else {
+                        let token =
+                            body.get("token").and_then(|v| v.as_str()).ok_or_else(|| {
+                                "Puter login response missing 'token' field".to_string()
+                            })?;
+                        info!("Puter: login successful on attempt {}", attempt);
+                        return Ok(token.to_string());
+                    }
+                }
+            }
+
+            if attempt < LOGIN_MAX_RETRIES {
+                let delay = LOGIN_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                let jitter = rand::random::<u64>() % (delay / 2);
+                let total = delay + jitter;
+                info!("Puter: retrying login in {}ms...", total);
+                tokio::time::sleep(Duration::from_millis(total)).await;
+            }
         }
 
-        let token = body
-            .get("token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Puter login response missing 'token' field".to_string())?;
-
-        info!("Puter: login successful, token obtained");
-        Ok(token.to_string())
+        Err(format!(
+            "Puter login failed after {} attempts: {}",
+            LOGIN_MAX_RETRIES, last_err
+        ))
     }
 
     /// Invalidate the cached token so next call re-authenticates.
@@ -694,47 +733,83 @@ impl PuterProvider {
     }
 }
 
-/// Standalone login function usable from async_stream context.
+/// Standalone login function with retry, usable from async_stream context.
 async fn do_login(client: &Client, username: &str, password: &str) -> Result<String, String> {
-    info!("Puter: logging in as '{}'...", username);
+    let mut last_err = String::new();
 
-    let payload = json!({
-        "username": username,
-        "password": password,
-    });
+    for attempt in 1..=LOGIN_MAX_RETRIES {
+        info!(
+            "Puter: login attempt {}/{} as '{}'...",
+            attempt, LOGIN_MAX_RETRIES, username
+        );
 
-    let response = client
-        .post(LOGIN_URL)
-        .header("Content-Type", "application/json")
-        .header("Origin", "https://puter.com")
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-        )
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("Puter login request failed: {}", e))?;
+        let payload = json!({
+            "username": username,
+            "password": password,
+        });
 
-    let status = response.status().as_u16();
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Puter login response parse error: {}", e))?;
+        let result = client
+            .post(LOGIN_URL)
+            .header("Content-Type", "application/json")
+            .header("Origin", "https://puter.com")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
+            )
+            .json(&payload)
+            .send()
+            .await;
 
-    if status >= 400 {
-        let msg = body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown error");
-        return Err(format!("Puter login failed ({}): {}", status, msg));
+        match result {
+            Err(e) => {
+                last_err = format!("Puter login request failed: {}", e);
+                warn!(
+                    "Puter login attempt {}/{} failed: {}",
+                    attempt, LOGIN_MAX_RETRIES, last_err
+                );
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body: Value = response
+                    .json()
+                    .await
+                    .map_err(|e| format!("Puter login response parse error: {}", e))?;
+
+                if status >= 400 {
+                    let msg = body
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown error");
+                    last_err = format!("Puter login failed ({}): {}", status, msg);
+                    if status == 401 || status == 403 {
+                        return Err(last_err);
+                    }
+                    warn!(
+                        "Puter login attempt {}/{} failed: {}",
+                        attempt, LOGIN_MAX_RETRIES, last_err
+                    );
+                } else {
+                    let token = body
+                        .get("token")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "Puter login response missing 'token' field".to_string())?;
+                    info!("Puter: login successful on attempt {}", attempt);
+                    return Ok(token.to_string());
+                }
+            }
+        }
+
+        if attempt < LOGIN_MAX_RETRIES {
+            let delay = LOGIN_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+            let jitter = rand::random::<u64>() % (delay / 2);
+            let total = delay + jitter;
+            info!("Puter: retrying login in {}ms...", total);
+            tokio::time::sleep(Duration::from_millis(total)).await;
+        }
     }
 
-    let token = body
-        .get("token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Puter login response missing 'token' field".to_string())?;
-
-    info!("Puter: login successful");
-    Ok(token.to_string())
+    Err(format!(
+        "Puter login failed after {} attempts: {}",
+        LOGIN_MAX_RETRIES, last_err
+    ))
 }
