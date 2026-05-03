@@ -4,7 +4,7 @@
 //! and compacts it to a ~200-token summary + extracted environment facts.
 //! This saves 90%+ of system prompt tokens while preserving instruction semantics.
 //!
-//! Ported from WindsurfAPI/src/client.js: compactSystemPromptForCascade()
+//! Inspired by system prompt compaction techniques.
 
 use regex::Regex;
 

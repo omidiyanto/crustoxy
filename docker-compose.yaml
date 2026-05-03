@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   crustoxy:
     # build: .
@@ -10,9 +8,6 @@ services:
       - "8082:8082"
     env_file:
       - .env
-    volumes:
-      # Persist Windsurf LS data (session cache, database) across restarts
-      - ./data:/opt/windsurf/data
     # Note: NET_ADMIN capability and /dev/net/tun device are required 
     # for Cloudflare WARP to properly establish a connection inside the container.
     cap_add:

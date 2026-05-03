@@ -17,13 +17,13 @@ use crate::models::anthropic::{
 };
 use crate::optimization::try_optimizations;
 use crate::providers::OpenAICompatProvider;
-use crate::providers::WindsurfProvider;
+use crate::providers::PuterProvider;
 use crate::rtk;
 
 pub struct AppState {
     pub settings: Settings,
     pub provider: OpenAICompatProvider,
-    pub windsurf_provider: Option<std::sync::Arc<WindsurfProvider>>,
+    pub puter_provider: Option<std::sync::Arc<PuterProvider>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -101,17 +101,17 @@ pub async fn create_message(
     let request_id = format!("req_{}", &Uuid::new_v4().to_string()[..12]);
     let input_tokens = count_request_tokens(&request);
 
-    // Check if this request should go to the Windsurf provider
+    // Check if this request should go to the Puter provider
     let provider_type = request
         .resolved_provider_model
         .as_deref()
         .map(Settings::parse_provider_type)
         .unwrap_or("");
 
-    if provider_type == "windsurf" {
-        if let Some(ref ws) = state.windsurf_provider {
+    if provider_type == "puter" {
+        if let Some(ref pp) = state.puter_provider {
             if request.stream == Some(false) {
-                let result = ws
+                let result = pp
                     .send_non_streaming(&request, input_tokens, &request_id)
                     .await;
                 return match result {
@@ -127,7 +127,7 @@ pub async fn create_message(
                 };
             }
 
-            let stream = ws.stream_response(&request, input_tokens, &request_id);
+            let stream = pp.stream_response(&request, input_tokens, &request_id);
             let body_stream =
                 tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
 
@@ -146,7 +146,7 @@ pub async fn create_message(
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": "Windsurf provider not enabled. Set CODEIUM_AUTH_TOKEN to enable."
+                        "message": "Puter provider not enabled. Set PUTER_API_KEY to enable."
                     }
                 })),
             )
@@ -225,15 +225,10 @@ pub async fn count_tokens(
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let provider_type = Settings::parse_provider_type(&state.settings.model);
 
-    let windsurf_status = match state.windsurf_provider {
-        Some(ref ws) => {
-            if ws.is_healthy().await {
-                "healthy"
-            } else {
-                "unhealthy"
-            }
-        }
-        None => "disabled",
+    let puter_status = if state.puter_provider.is_some() {
+        "enabled"
+    } else {
+        "disabled"
     };
 
     Json(json!({
@@ -245,7 +240,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             "ip_rotation": state.settings.enable_ip_rotation,
             "tool_retry": state.settings.enable_tool_retry,
             "rtk": state.settings.enable_rtk,
-            "windsurf": windsurf_status,
+            "puter": puter_status,
         }
     }))
 }

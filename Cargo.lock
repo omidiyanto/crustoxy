@@ -169,11 +169,8 @@ version = "2.0.0"
 dependencies = [
  "async-stream",
  "axum",
- "bytes",
  "dotenvy",
  "futures-util",
- "h2",
- "http",
  "rand",
  "regex",
  "reqwest",
