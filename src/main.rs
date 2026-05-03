@@ -47,40 +47,30 @@ async fn main() {
     let settings = Settings::from_env();
     let provider = OpenAICompatProvider::new(&settings);
 
-    // Conditional Windsurf provider initialization
-    let windsurf_provider = if let Some(ref auth_token) = settings.codeium_auth_token {
-        info!("CODEIUM_AUTH_TOKEN detected, initializing Windsurf provider...");
-        match providers::WindsurfProvider::new(
-            auth_token,
-            &settings.windsurf_ls_path,
-            settings.windsurf_ls_port,
-            &settings.windsurf_api_server_url,
-            &settings.windsurf_data_dir,
-        )
-        .await
-        {
-            Ok(wp) => {
-                info!("Windsurf provider ready");
-                Some(Arc::new(wp))
+    // Conditional Puter provider initialization
+    let puter_provider = if let Some(ref creds) = settings.puter_api_key {
+        info!("PUTER_API_KEY detected, initializing Puter provider...");
+        match providers::PuterProvider::new(creds, &settings).await {
+            Ok(pp) => {
+                info!("Puter provider ready");
+                Some(Arc::new(pp))
             }
             Err(e) => {
-                tracing::error!("Failed to initialize Windsurf provider: {}", e);
-                info!("Continuing without Windsurf provider");
+                tracing::error!("Failed to initialize Puter provider: {}", e);
+                info!("Continuing without Puter provider");
                 None
             }
         }
     } else {
-        info!("Windsurf provider disabled (CODEIUM_AUTH_TOKEN not set)");
+        info!("Puter provider disabled (PUTER_API_KEY not set)");
         None
     };
 
     let state = Arc::new(AppState {
         settings: settings.clone(),
         provider,
-        windsurf_provider,
+        puter_provider,
     });
-
-    let shutdown_state = state.clone();
 
     let app = Router::new()
         .route("/v1/messages", post(routes::create_message))
@@ -106,10 +96,6 @@ async fn main() {
         .with_graceful_shutdown(async move {
             tokio::signal::ctrl_c().await.ok();
             info!("Received shutdown signal");
-            if let Some(ref ws) = shutdown_state.windsurf_provider {
-                ws.shutdown().await;
-                info!("Windsurf provider shut down");
-            }
         })
         .await
         .unwrap();

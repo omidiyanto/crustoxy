@@ -1,5 +1,5 @@
 pub mod openai_compat;
-pub mod windsurf;
+pub mod puter;
 
 pub use openai_compat::OpenAICompatProvider;
-pub use windsurf::WindsurfProvider;
+pub use puter::PuterProvider;
