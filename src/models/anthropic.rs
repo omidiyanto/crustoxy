@@ -26,7 +26,7 @@ pub struct MessagesRequest {
     #[serde(default)]
     pub tool_choice: Option<Value>,
     #[serde(default)]
-    pub thinking: Option<ThinkingConfig>,
+    pub thinking: Option<Value>,
     #[serde(default)]
     pub extra_body: Option<Value>,
 
@@ -120,16 +120,6 @@ fn default_input_schema() -> Value {
         "type": "object",
         "properties": {}
     })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThinkingConfig {
-    #[serde(default = "default_true_bool")]
-    pub enabled: bool,
-}
-
-fn default_true_bool() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

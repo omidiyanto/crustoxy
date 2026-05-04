@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,14 +11,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::Settings;
-use crate::converter::build_openai_request;
 use crate::heuristic_tool_parser::HeuristicToolParser;
 use crate::models::anthropic::MessagesRequest;
 use crate::sse::SSEBuilder;
-use crate::think_parser::{ContentType, ThinkTagParser};
 
 const LOGIN_URL: &str = "https://puter.com/login";
-const CHAT_URL: &str = "https://api.puter.com/drivers/call";
+const ANTHROPIC_PROXY_URL: &str = "https://api.puter.com/puterai/anthropic/v1/messages";
 
 // Token refresh interval: 23 hours (Puter tokens typically expire in ~24h)
 const TOKEN_LIFETIME_SECS: u64 = 23 * 3600;
@@ -27,6 +26,15 @@ const LOGIN_BASE_DELAY_MS: u64 = 2000;
 struct CachedToken {
     token: String,
     obtained_at: Instant,
+}
+
+/// Track the block type by Puter's content_block index so we know how to route deltas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UpstreamBlockType {
+    Text,
+    Thinking,
+    ToolUse,
+    Other,
 }
 
 pub struct PuterProvider {
@@ -45,193 +53,22 @@ impl PuterProvider {
         let client = Client::builder()
             .timeout(Duration::from_secs(settings.http_read_timeout))
             .connect_timeout(Duration::from_secs(settings.http_connect_timeout))
-            .pool_max_idle_per_host(5)
+            .pool_max_idle_per_host(10)
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        let provider = Self {
+        info!("Puter provider created (login deferred to first request)");
+        Ok(Self {
             client,
             username: username.to_string(),
             password: password.to_string(),
             cached_token: Arc::new(RwLock::new(None)),
-        };
-
-        // Lazy login: defer to first request so WARP/network has time to initialize
-        info!("Puter provider created (login deferred to first request)");
-        Ok(provider)
-    }
-
-    /// Get a valid token, re-authenticating only if needed.
-    async fn ensure_token(&self) -> Result<String, String> {
-        // Fast path: check if we have a valid cached token
-        {
-            let cached = self.cached_token.read().await;
-            if let Some(ref ct) = *cached {
-                if ct.obtained_at.elapsed().as_secs() < TOKEN_LIFETIME_SECS {
-                    return Ok(ct.token.clone());
-                }
-                info!("Puter token expired, re-authenticating...");
-            }
-        }
-
-        // Slow path: need to login
-        let token = self.login().await?;
-
-        // Store the token
-        {
-            let mut cached = self.cached_token.write().await;
-            *cached = Some(CachedToken {
-                token: token.clone(),
-                obtained_at: Instant::now(),
-            });
-        }
-
-        Ok(token)
-    }
-
-    /// Perform login to Puter with retry and exponential backoff.
-    async fn login(&self) -> Result<String, String> {
-        let mut last_err = String::new();
-
-        for attempt in 1..=LOGIN_MAX_RETRIES {
-            info!(
-                "Puter: login attempt {}/{} as '{}'...",
-                attempt, LOGIN_MAX_RETRIES, self.username
-            );
-
-            let payload = json!({
-                "username": self.username,
-                "password": self.password,
-            });
-
-            let result = self
-                .client
-                .post(LOGIN_URL)
-                .header("Content-Type", "application/json")
-                .header("Origin", "https://puter.com")
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-                )
-                .json(&payload)
-                .send()
-                .await;
-
-            match result {
-                Err(e) => {
-                    last_err = format!("Puter login request failed: {}", e);
-                    warn!(
-                        "Puter login attempt {}/{} failed: {}",
-                        attempt, LOGIN_MAX_RETRIES, last_err
-                    );
-                }
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let body: Value = response
-                        .json()
-                        .await
-                        .map_err(|e| format!("Puter login response parse error: {}", e))?;
-
-                    if status >= 400 {
-                        let msg = body
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Unknown error");
-                        last_err = format!("Puter login failed ({}): {}", status, msg);
-                        // Don't retry on 401/403 (bad credentials)
-                        if status == 401 || status == 403 {
-                            return Err(last_err);
-                        }
-                        warn!(
-                            "Puter login attempt {}/{} failed: {}",
-                            attempt, LOGIN_MAX_RETRIES, last_err
-                        );
-                    } else {
-                        let token =
-                            body.get("token").and_then(|v| v.as_str()).ok_or_else(|| {
-                                "Puter login response missing 'token' field".to_string()
-                            })?;
-                        info!("Puter: login successful on attempt {}", attempt);
-                        return Ok(token.to_string());
-                    }
-                }
-            }
-
-            if attempt < LOGIN_MAX_RETRIES {
-                let delay = LOGIN_BASE_DELAY_MS * 2u64.pow(attempt - 1);
-                let jitter = rand::random::<u64>() % (delay / 2);
-                let total = delay + jitter;
-                info!("Puter: retrying login in {}ms...", total);
-                tokio::time::sleep(Duration::from_millis(total)).await;
-            }
-        }
-
-        Err(format!(
-            "Puter login failed after {} attempts: {}",
-            LOGIN_MAX_RETRIES, last_err
-        ))
-    }
-
-    /// Invalidate the cached token so next call re-authenticates.
-    async fn invalidate_token(&self) {
-        let mut cached = self.cached_token.write().await;
-        *cached = None;
-    }
-
-    /// Build the Puter chat payload from a list of OpenAI-style messages.
-    fn build_chat_payload(token: &str, model: &str, messages: &[Value], stream: bool) -> Value {
-        json!({
-            "interface": "puter-chat-completion",
-            "driver": "ai-chat",
-            "test_mode": false,
-            "method": "complete",
-            "args": {
-                "messages": messages,
-                "model": model,
-                "stream": stream,
-            },
-            "auth_token": token,
         })
     }
 
-    /// Convert our internal OpenAI messages format to Puter's simplified messages format.
-    fn convert_messages_for_puter(request: &MessagesRequest) -> Vec<Value> {
-        let openai_req = build_openai_request(request, &request.model);
-        let mut messages = Vec::new();
-
-        for msg in &openai_req.messages {
-            let mut puter_msg = json!({});
-
-            if let Some(ref content) = msg.content {
-                puter_msg["content"] = json!(content);
-            }
-
-            // Map roles
-            match msg.role.as_str() {
-                "system" => puter_msg["role"] = json!("system"),
-                "assistant" => puter_msg["role"] = json!("assistant"),
-                "tool" => {
-                    // Puter doesn't support tool role; convert to user
-                    puter_msg["role"] = json!("user");
-                    if let Some(ref content) = msg.content {
-                        puter_msg["content"] = json!(format!("[Tool Result]: {}", content));
-                    }
-                }
-                _ => puter_msg["role"] = json!("user"),
-            }
-
-            messages.push(puter_msg);
-        }
-
-        messages
-    }
-
-    pub fn stream_response(
-        &self,
-        request: &MessagesRequest,
-        input_tokens: u32,
-        request_id: &str,
-    ) -> impl Stream<Item = String> + use<> {
+    /// Build a clean Anthropic request body for forwarding to Puter.
+    /// Strips crustoxy-internal/null fields and patches `model` to the actual provider model name.
+    fn build_forward_body(request: &MessagesRequest) -> Value {
         let model_name = Settings::parse_model_name(
             request
                 .resolved_provider_model
@@ -240,67 +77,72 @@ impl PuterProvider {
         )
         .to_string();
 
+        let mut body = serde_json::to_value(request).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), json!(model_name));
+            obj.remove("extra_body");
+            // Strip null fields to keep the forwarded body clean
+            let null_keys: Vec<String> = obj
+                .iter()
+                .filter_map(|(k, v)| if v.is_null() { Some(k.clone()) } else { None })
+                .collect();
+            for k in null_keys {
+                obj.remove(&k);
+            }
+        }
+        body
+    }
+
+    pub fn stream_response(
+        &self,
+        request: &MessagesRequest,
+        input_tokens: u32,
+        request_id: &str,
+    ) -> impl Stream<Item = String> + use<> {
         let request_model = request.model.clone();
-        let message_id = format!("msg_{}", Uuid::new_v4());
-        let messages = Self::convert_messages_for_puter(request);
-        let request_id = request_id.to_string();
+        let mut forward_body = Self::build_forward_body(request);
+        if let Some(obj) = forward_body.as_object_mut() {
+            obj.insert("stream".to_string(), json!(true));
+        }
+
+        let model_for_log = forward_body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let msg_count = forward_body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let tool_count = forward_body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
 
         let client = self.client.clone();
         let cached_token = self.cached_token.clone();
         let username = self.username.clone();
         let password = self.password.clone();
+        let request_id = request_id.to_string();
 
         info!(
-            "PUTER_STREAM: request_id={} model={} msgs={}",
-            request_id,
-            model_name,
-            messages.len(),
+            "PUTER_STREAM: request_id={} model={} msgs={} tools={}",
+            request_id, model_for_log, msg_count, tool_count,
         );
 
         async_stream::stream! {
-            let mut sse = SSEBuilder::new(message_id, request_model, input_tokens);
+            let message_id = format!("msg_{}", Uuid::new_v4());
+            let mut sse = SSEBuilder::new(message_id, request_model.clone(), input_tokens);
             yield sse.message_start();
 
-            // Get token (with retry on auth failure)
-            let token = {
-                let cached = cached_token.read().await;
-                match &*cached {
-                    Some(ct) if ct.obtained_at.elapsed().as_secs() < TOKEN_LIFETIME_SECS => {
-                        ct.token.clone()
-                    }
-                    _ => {
-                        drop(cached);
-                        // Re-login
-                        match do_login(&client, &username, &password).await {
-                            Ok(new_token) => {
-                                let mut cached = cached_token.write().await;
-                                *cached = Some(CachedToken {
-                                    token: new_token.clone(),
-                                    obtained_at: Instant::now(),
-                                });
-                                new_token
-                            }
-                            Err(e) => {
-                                error!("Puter auth failed: {}", e);
-                                for event in sse.emit_error(&format!("Puter auth failed: {}", e)) {
-                                    yield event;
-                                }
-                                yield sse.message_delta("end_turn", 0);
-                                yield sse.message_stop();
-                                return;
-                            }
-                        }
-                    }
-                }
-            };
+            let mut attempts: u32 = 0;
+            let max_attempts: u32 = 2;
 
-            // Attempt request, retry once on auth error
-            let mut attempts = 0;
-            let mut current_token = token;
-
-            'auth_retry: loop {
+            'retry: loop {
                 attempts += 1;
-                if attempts > 2 {
+                if attempts > max_attempts {
                     for event in sse.emit_error("Puter: auth retry exhausted") {
                         yield event;
                     }
@@ -309,17 +151,30 @@ impl PuterProvider {
                     return;
                 }
 
-                let payload = PuterProvider::build_chat_payload(&current_token, &model_name, &messages, true);
+                let token = match ensure_token(&client, &cached_token, &username, &password).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("Puter auth failed: {}", e);
+                        for event in sse.emit_error(&format!("Puter auth failed: {}", e)) {
+                            yield event;
+                        }
+                        yield sse.message_delta("end_turn", 0);
+                        yield sse.message_stop();
+                        return;
+                    }
+                };
 
                 let resp = client
-                    .post(CHAT_URL)
-                    .header("Content-Type", "text/plain;actually=json")
-                    .header("Origin", "http://127.0.0.1:8000")
-                    .body(serde_json::to_string(&payload).unwrap())
+                    .post(ANTHROPIC_PROXY_URL)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("anthropic-version", "2023-06-01")
+                    .header("Accept", "text/event-stream")
+                    .json(&forward_body)
                     .send()
                     .await;
 
-                match resp {
+                let response = match resp {
                     Err(e) => {
                         error!("PUTER_STREAM_ERROR: request_id={} error={}", request_id, e);
                         for event in sse.emit_error(&format!("Puter connection error: {}", e)) {
@@ -329,293 +184,321 @@ impl PuterProvider {
                         yield sse.message_stop();
                         return;
                     }
-                    Ok(response) => {
-                        let status = response.status().as_u16();
+                    Ok(r) => r,
+                };
 
-                        // Auth error → invalidate and retry
-                        if status == 401 || status == 403 {
-                            warn!("Puter auth error ({}), re-authenticating...", status);
-                            match do_login(&client, &username, &password).await {
-                                Ok(new_token) => {
-                                    let mut cached = cached_token.write().await;
-                                    *cached = Some(CachedToken {
-                                        token: new_token.clone(),
-                                        obtained_at: Instant::now(),
-                                    });
-                                    current_token = new_token;
-                                    continue 'auth_retry;
-                                }
-                                Err(e) => {
-                                    error!("Puter re-auth failed: {}", e);
-                                    for event in sse.emit_error(&format!("Puter re-auth failed: {}", e)) {
-                                        yield event;
-                                    }
-                                    yield sse.message_delta("end_turn", 0);
-                                    yield sse.message_stop();
-                                    return;
-                                }
-                            }
+                let status = response.status().as_u16();
+
+                if status == 401 || status == 403 {
+                    warn!("Puter auth error ({}), invalidating token and retrying...", status);
+                    let mut cached = cached_token.write().await;
+                    *cached = None;
+                    drop(cached);
+                    continue 'retry;
+                }
+
+                if status >= 400 {
+                    let body_text = response.text().await.unwrap_or_default();
+                    error!("Puter API error {}: {}", status, body_text);
+                    let trunc = &body_text[..body_text.len().min(500)];
+                    for event in sse.emit_error(&format!("Puter error {}: {}", status, trunc)) {
+                        yield event;
+                    }
+                    yield sse.message_delta("end_turn", 0);
+                    yield sse.message_stop();
+                    return;
+                }
+
+                // ── Parse Puter's Anthropic SSE stream ──
+                // We parse each event and re-emit using our SSEBuilder so we can:
+                // 1. Intercept text_delta and run HeuristicToolParser (for models
+                //    that emit raw `functions.Name:N{json}` tool calls).
+                // 2. Keep our block indices consistent when inserting tool_use blocks.
+                let mut heuristic_parser = HeuristicToolParser::new();
+                let mut had_tool_call = false;
+                let mut finish_reason: Option<String> = None;
+                let mut usage_output_tokens: Option<u32> = None;
+                // Maps Puter's upstream content_block index → our local block type
+                let mut upstream_block_types: HashMap<u64, UpstreamBlockType> = HashMap::new();
+                // Track tool index → sse tool_index (for native tool_use passthrough)
+                let mut upstream_tool_index_map: HashMap<u64, i32> = HashMap::new();
+                let mut next_tool_index: i32 = 0;
+
+                let mut byte_stream = response.bytes_stream();
+                let mut line_buffer = String::new();
+                let mut current_event: Option<String> = None;
+
+                while let Some(chunk_result) = byte_stream.next().await {
+                    let bytes = match chunk_result {
+                        Ok(b) => b,
+                        Err(e) => {
+                            error!("Puter stream read error: {}", e);
+                            break;
+                        }
+                    };
+
+                    line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                    while let Some(newline_pos) = line_buffer.find('\n') {
+                        let line = line_buffer[..newline_pos].trim_end_matches('\r').to_string();
+                        line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+                        if line.is_empty() {
+                            // End of SSE event; reset current_event
+                            current_event = None;
+                            continue;
                         }
 
-                        if status >= 400 {
-                            let body_text = response.text().await.unwrap_or_default();
-                            error!("Puter API error {}: {}", status, body_text);
-                            for event in sse.emit_error(&format!("Puter error {}: {}", status, &body_text[..body_text.len().min(200)])) {
-                                yield event;
-                            }
-                            yield sse.message_delta("end_turn", 0);
-                            yield sse.message_stop();
-                            return;
+                        if let Some(name) = line.strip_prefix("event: ") {
+                            current_event = Some(name.to_string());
+                            continue;
                         }
 
-                        // ── Process streaming response ──
-                        // Puter streams newline-delimited JSON objects:
-                        // {"type": "reasoning", "reasoning": "..."} for thinking
-                        // {"type": "text", "text": "..."} for text content
-                        let mut think_parser = ThinkTagParser::new();
-                        let mut heuristic_parser = HeuristicToolParser::new();
-                        let mut had_tool_call = false;
-                        let mut byte_stream = response.bytes_stream();
-                        let mut line_buffer = String::new();
+                        let Some(data_str) = line.strip_prefix("data: ") else {
+                            continue;
+                        };
 
-                        while let Some(chunk_result) = byte_stream.next().await {
-                            let bytes = match chunk_result {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    error!("Puter stream read error: {}", e);
-                                    break;
-                                }
-                            };
+                        let data: Value = match serde_json::from_str(data_str) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                debug!("Puter: skipping unparseable SSE data: {} ({})", data_str, e);
+                                continue;
+                            }
+                        };
 
-                            line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let event_name = current_event.as_deref().unwrap_or_else(|| {
+                            data.get("type").and_then(|v| v.as_str()).unwrap_or("")
+                        });
 
-                            while let Some(newline_pos) = line_buffer.find('\n') {
-                                let line = line_buffer[..newline_pos].trim().to_string();
-                                line_buffer = line_buffer[newline_pos + 1..].to_string();
+                        match event_name {
+                            "message_start" => {
+                                // Ignore — we emit our own message_start at the top
+                            }
+                            "content_block_start" => {
+                                let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let block = data.get("content_block").cloned().unwrap_or(json!({}));
+                                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                                if line.is_empty() {
-                                    continue;
-                                }
-
-                                let chunk: Value = match serde_json::from_str(&line) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        debug!("Puter: skipping unparseable chunk: {} ({})", &line[..line.len().min(100)], e);
-                                        continue;
+                                match block_type {
+                                    "text" => {
+                                        upstream_block_types.insert(idx, UpstreamBlockType::Text);
+                                        // Lazy: only create local text block when first delta arrives
                                     }
-                                };
+                                    "thinking" => {
+                                        upstream_block_types.insert(idx, UpstreamBlockType::Thinking);
+                                        // Lazy: only create local thinking block when first delta arrives
+                                    }
+                                    "tool_use" => {
+                                        upstream_block_types.insert(idx, UpstreamBlockType::ToolUse);
+                                        had_tool_call = true;
+                                        let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-                                let chunk_type = chunk.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                        // Close any open text/thinking block before a native tool_use
+                                        for event in sse.close_content_blocks() {
+                                            yield event;
+                                        }
 
-                                match chunk_type {
-                                    "reasoning" => {
-                                        if let Some(reasoning) = chunk.get("reasoning").and_then(|v| v.as_str())
-                                            && !reasoning.is_empty()
+                                        let my_idx = next_tool_index;
+                                        next_tool_index += 1;
+                                        upstream_tool_index_map.insert(idx, my_idx);
+                                        sse.blocks.register_tool_name(my_idx, &tool_name);
+                                        yield sse.start_tool_block(my_idx, &tool_id, &tool_name);
+                                    }
+                                    _ => {
+                                        upstream_block_types.insert(idx, UpstreamBlockType::Other);
+                                    }
+                                }
+                            }
+                            "content_block_delta" => {
+                                let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let delta = data.get("delta").cloned().unwrap_or(json!({}));
+                                let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                let block_type = upstream_block_types.get(&idx).copied().unwrap_or(UpstreamBlockType::Other);
+
+                                match (block_type, delta_type) {
+                                    (UpstreamBlockType::Text, "text_delta") => {
+                                        if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                            let (filtered_text, detected_tools) = heuristic_parser.feed(text);
+
+                                            if !filtered_text.is_empty() {
+                                                for event in sse.ensure_text_block() {
+                                                    yield event;
+                                                }
+                                                yield sse.emit_text_delta(&filtered_text);
+                                            }
+
+                                            for tool_use in &detected_tools {
+                                                had_tool_call = true;
+                                                for event in sse.close_content_blocks() {
+                                                    yield event;
+                                                }
+                                                let block_idx = sse.blocks.allocate_index();
+                                                let mut input = tool_use.input.clone();
+                                                if tool_use.name == "Task" {
+                                                    input.insert(
+                                                        "run_in_background".to_string(),
+                                                        "false".to_string(),
+                                                    );
+                                                }
+                                                let input_json = serde_json::to_string(&input)
+                                                    .unwrap_or_else(|_| "{}".to_string());
+                                                yield sse.content_block_start(
+                                                    block_idx,
+                                                    "tool_use",
+                                                    json!({"id": tool_use.id, "name": tool_use.name}),
+                                                );
+                                                yield sse.content_block_delta(
+                                                    block_idx,
+                                                    "input_json_delta",
+                                                    &input_json,
+                                                );
+                                                yield sse.content_block_stop(block_idx);
+                                            }
+                                        }
+                                    }
+                                    (UpstreamBlockType::Thinking, "thinking_delta") => {
+                                        if let Some(text) = delta.get("thinking").and_then(|v| v.as_str())
+                                            && !text.is_empty()
                                         {
                                             for event in sse.ensure_thinking_block() {
                                                 yield event;
                                             }
-                                            yield sse.emit_thinking_delta(reasoning);
+                                            yield sse.emit_thinking_delta(text);
                                         }
                                     }
-                                    "text" => {
-                                        if let Some(text) = chunk.get("text").and_then(|v| v.as_str())
-                                            && !text.is_empty()
+                                    (UpstreamBlockType::Thinking, "signature_delta") => {
+                                        // Signature is metadata for verified thinking; ignore
+                                    }
+                                    (UpstreamBlockType::ToolUse, "input_json_delta") => {
+                                        if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str())
+                                            && let Some(&my_idx) = upstream_tool_index_map.get(&idx)
                                         {
-                                            // Run through think tag parser for inline <think> tags
-                                            let think_chunks = think_parser.feed(text);
-                                            for c in think_chunks {
-                                                match c.content_type {
-                                                    ContentType::Thinking => {
-                                                        for event in sse.ensure_thinking_block() {
-                                                            yield event;
-                                                        }
-                                                        yield sse.emit_thinking_delta(&c.content);
-                                                    }
-                                                    ContentType::Text => {
-                                                        // Run heuristic tool parser on text
-                                                        let (filtered_text, detected_tools) =
-                                                            heuristic_parser.feed(&c.content);
-
-                                                        if !filtered_text.is_empty() {
-                                                            for event in sse.ensure_text_block() {
-                                                                yield event;
-                                                            }
-                                                            yield sse.emit_text_delta(&filtered_text);
-                                                        }
-
-                                                        for tool_use in &detected_tools {
-                                                            had_tool_call = true;
-                                                            for event in sse.close_content_blocks() {
-                                                                yield event;
-                                                            }
-                                                            let block_idx = sse.blocks.allocate_index();
-                                                            let mut input = tool_use.input.clone();
-                                                            if tool_use.name == "Task" {
-                                                                input.insert(
-                                                                    "run_in_background".to_string(),
-                                                                    "false".to_string(),
-                                                                );
-                                                            }
-                                                            let input_json = serde_json::to_string(&input)
-                                                                .unwrap_or_else(|_| "{}".to_string());
-                                                            yield sse.content_block_start(
-                                                                block_idx,
-                                                                "tool_use",
-                                                                json!({"id": tool_use.id, "name": tool_use.name}),
-                                                            );
-                                                            yield sse.content_block_delta(
-                                                                block_idx,
-                                                                "input_json_delta",
-                                                                &input_json,
-                                                            );
-                                                            yield sse.content_block_stop(block_idx);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "error" => {
-                                        let msg = chunk.get("message")
-                                            .or_else(|| chunk.get("error"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("Unknown Puter error");
-                                        error!("Puter stream error: {}", msg);
-
-                                        // Check if auth-related error
-                                        let msg_lower = msg.to_lowercase();
-                                        if msg_lower.contains("token") || msg_lower.contains("auth") || msg_lower.contains("login") {
-                                            warn!("Puter token may be expired, invalidating...");
-                                            let mut cached = cached_token.write().await;
-                                            *cached = None;
-                                        }
-
-                                        for event in sse.emit_error(&format!("Puter: {}", msg)) {
-                                            yield event;
+                                            yield sse.emit_tool_delta(my_idx, partial);
                                         }
                                     }
                                     _ => {
-                                        // Unknown type — check if it has content/text field as fallback
-                                        if let Some(text) = chunk.get("text").and_then(|v| v.as_str())
-                                            && !text.is_empty()
-                                        {
-                                            for event in sse.ensure_text_block() {
-                                                yield event;
-                                            }
-                                            yield sse.emit_text_delta(text);
-                                        }
+                                        debug!(
+                                            "Puter: skipping unhandled delta (block_type={:?}, delta_type={})",
+                                            block_type, delta_type
+                                        );
                                     }
                                 }
                             }
-                        }
+                            "content_block_stop" => {
+                                let idx = data.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let block_type = upstream_block_types.get(&idx).copied().unwrap_or(UpstreamBlockType::Other);
 
-                        // Process remaining buffer
-                        if !line_buffer.trim().is_empty()
-                            && let Ok(chunk) = serde_json::from_str::<Value>(line_buffer.trim())
-                        {
-                            let chunk_type = chunk.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            match chunk_type {
-                                "reasoning" => {
-                                    if let Some(reasoning) = chunk.get("reasoning").and_then(|v| v.as_str())
-                                        && !reasoning.is_empty()
-                                    {
-                                        for event in sse.ensure_thinking_block() {
+                                match block_type {
+                                    UpstreamBlockType::ToolUse => {
+                                        if let Some(&my_idx) = upstream_tool_index_map.get(&idx)
+                                            && let Some(state) = sse.blocks.tool_states.get(&my_idx)
+                                            && state.started
+                                        {
+                                            let block_idx = state.block_index as u32;
+                                            yield sse.content_block_stop(block_idx);
+                                            if let Some(state) = sse.blocks.tool_states.get_mut(&my_idx) {
+                                                state.started = false;
+                                            }
+                                        }
+                                    }
+                                    UpstreamBlockType::Text | UpstreamBlockType::Thinking => {
+                                        // Close our local blocks (will be idempotent at final flush)
+                                        for event in sse.close_content_blocks() {
                                             yield event;
                                         }
-                                        yield sse.emit_thinking_delta(reasoning);
                                     }
-                                }
-                                "text" => {
-                                    if let Some(text) = chunk.get("text").and_then(|v| v.as_str())
-                                        && !text.is_empty()
-                                    {
-                                        let think_chunks = think_parser.feed(text);
-                                        for c in think_chunks {
-                                            match c.content_type {
-                                                ContentType::Thinking => {
-                                                    for event in sse.ensure_thinking_block() {
-                                                        yield event;
-                                                    }
-                                                    yield sse.emit_thinking_delta(&c.content);
-                                                }
-                                                ContentType::Text => {
-                                                    for event in sse.ensure_text_block() {
-                                                        yield event;
-                                                    }
-                                                    yield sse.emit_text_delta(&c.content);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        // Flush heuristic tool parser
-                        for tool_use in heuristic_parser.flush() {
-                            had_tool_call = true;
-                            for event in sse.close_content_blocks() {
-                                yield event;
-                            }
-                            let block_idx = sse.blocks.allocate_index();
-                            let mut input = tool_use.input.clone();
-                            if tool_use.name == "Task" {
-                                input.insert("run_in_background".to_string(), "false".to_string());
-                            }
-                            let input_json = serde_json::to_string(&input)
-                                .unwrap_or_else(|_| "{}".to_string());
-                            yield sse.content_block_start(
-                                block_idx,
-                                "tool_use",
-                                json!({"id": tool_use.id, "name": tool_use.name}),
-                            );
-                            yield sse.content_block_delta(
-                                block_idx,
-                                "input_json_delta",
-                                &input_json,
-                            );
-                            yield sse.content_block_stop(block_idx);
-                        }
-
-                        // Flush think parser
-                        if let Some(remaining) = think_parser.flush() {
-                            match remaining.content_type {
-                                ContentType::Thinking => {
-                                    for event in sse.ensure_thinking_block() {
-                                        yield event;
-                                    }
-                                    yield sse.emit_thinking_delta(&remaining.content);
-                                }
-                                ContentType::Text => {
-                                    for event in sse.ensure_text_block() {
-                                        yield event;
-                                    }
-                                    yield sse.emit_text_delta(&remaining.content);
+                                    UpstreamBlockType::Other => {}
                                 }
                             }
-                        }
-
-                        // Ensure at least one content block
-                        if !sse.has_any_content() {
-                            for event in sse.ensure_text_block() {
-                                yield event;
+                            "message_delta" => {
+                                if let Some(reason) = data.get("delta")
+                                    .and_then(|d| d.get("stop_reason"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    finish_reason = Some(reason.to_string());
+                                }
+                                if let Some(tokens) = data.get("usage")
+                                    .and_then(|u| u.get("output_tokens"))
+                                    .and_then(|v| v.as_u64())
+                                {
+                                    usage_output_tokens = Some(tokens as u32);
+                                }
                             }
-                            yield sse.emit_text_delta(" ");
+                            "message_stop" => {
+                                // Will emit our own after loop
+                            }
+                            "error" => {
+                                let msg = data.get("error")
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Unknown Puter error");
+                                error!("Puter stream error: {}", msg);
+                                for event in sse.emit_error(&format!("Puter: {}", msg)) {
+                                    yield event;
+                                }
+                            }
+                            "ping" => {
+                                // Ignore keepalive pings
+                            }
+                            _ => {
+                                debug!("Puter: ignoring unknown event type: {}", event_name);
+                            }
                         }
-
-                        for event in sse.close_all_blocks() {
-                            yield event;
-                        }
-
-                        let output_tokens = sse.estimate_output_tokens();
-                        let stop_reason = if had_tool_call { "tool_use" } else { "end_turn" };
-                        yield sse.message_delta(stop_reason, output_tokens);
-                        yield sse.message_stop();
-                        return;
                     }
                 }
+
+                // Flush heuristic tool parser for any trailing tool calls
+                for tool_use in heuristic_parser.flush() {
+                    had_tool_call = true;
+                    for event in sse.close_content_blocks() {
+                        yield event;
+                    }
+                    let block_idx = sse.blocks.allocate_index();
+                    let mut input = tool_use.input.clone();
+                    if tool_use.name == "Task" {
+                        input.insert("run_in_background".to_string(), "false".to_string());
+                    }
+                    let input_json = serde_json::to_string(&input)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    yield sse.content_block_start(
+                        block_idx,
+                        "tool_use",
+                        json!({"id": tool_use.id, "name": tool_use.name}),
+                    );
+                    yield sse.content_block_delta(
+                        block_idx,
+                        "input_json_delta",
+                        &input_json,
+                    );
+                    yield sse.content_block_stop(block_idx);
+                }
+
+                if !sse.has_any_content() {
+                    for event in sse.ensure_text_block() {
+                        yield event;
+                    }
+                    yield sse.emit_text_delta(" ");
+                }
+
+                for event in sse.close_all_blocks() {
+                    yield event;
+                }
+
+                let output_tokens = usage_output_tokens.unwrap_or_else(|| sse.estimate_output_tokens());
+                let stop_reason = if had_tool_call {
+                    "tool_use"
+                } else {
+                    match finish_reason.as_deref() {
+                        Some("tool_use") => "tool_use",
+                        Some("max_tokens") => "max_tokens",
+                        Some("stop_sequence") => "stop_sequence",
+                        _ => "end_turn",
+                    }
+                };
+                yield sse.message_delta(stop_reason, output_tokens);
+                yield sse.message_stop();
+                return;
             }
         }
     }
@@ -623,229 +506,106 @@ impl PuterProvider {
     pub async fn send_non_streaming(
         &self,
         request: &MessagesRequest,
-        input_tokens: u32,
+        _input_tokens: u32,
         request_id: &str,
     ) -> Result<Value, String> {
-        let model_name = Settings::parse_model_name(
-            request
-                .resolved_provider_model
-                .as_deref()
-                .unwrap_or(&request.model),
-        );
+        let mut forward_body = Self::build_forward_body(request);
+        if let Some(obj) = forward_body.as_object_mut() {
+            obj.insert("stream".to_string(), json!(false));
+        }
 
-        let messages = Self::convert_messages_for_puter(request);
+        let model_for_log = forward_body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
 
         info!(
             "PUTER_NON_STREAM: request_id={} model={}",
-            request_id, model_name,
+            request_id, model_for_log
         );
 
-        let token = self.ensure_token().await?;
-        let payload = Self::build_chat_payload(&token, model_name, &messages, false);
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            if attempts > 2 {
+                return Err("Puter: auth retry exhausted".to_string());
+            }
 
-        let response = self
-            .client
-            .post(CHAT_URL)
-            .header("Content-Type", "text/plain;actually=json")
-            .header("Origin", "http://127.0.0.1:8000")
-            .body(serde_json::to_string(&payload).unwrap())
-            .send()
-            .await
-            .map_err(|e| format!("Puter connection error: {}", e))?;
-
-        let status = response.status().as_u16();
-
-        // Retry on auth error
-        if status == 401 || status == 403 {
-            warn!("Puter auth error on non-streaming, re-authenticating...");
-            self.invalidate_token().await;
-            let new_token = self.ensure_token().await?;
-            let payload = Self::build_chat_payload(&new_token, model_name, &messages, false);
+            let token = ensure_token(
+                &self.client,
+                &self.cached_token,
+                &self.username,
+                &self.password,
+            )
+            .await?;
 
             let response = self
                 .client
-                .post(CHAT_URL)
-                .header("Content-Type", "text/plain;actually=json")
-                .header("Origin", "http://127.0.0.1:8000")
-                .body(serde_json::to_string(&payload).unwrap())
+                .post(ANTHROPIC_PROXY_URL)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("anthropic-version", "2023-06-01")
+                .json(&forward_body)
                 .send()
                 .await
                 .map_err(|e| format!("Puter connection error: {}", e))?;
 
             let status = response.status().as_u16();
+
+            if status == 401 || status == 403 {
+                warn!(
+                    "Puter auth error ({}), invalidating token and retrying...",
+                    status
+                );
+                let mut cached = self.cached_token.write().await;
+                *cached = None;
+                drop(cached);
+                continue;
+            }
+
             if status >= 400 {
                 let body_text = response.text().await.unwrap_or_default();
-                return Err(format!(
-                    "Puter error {}: {}",
-                    status,
-                    &body_text[..body_text.len().min(200)]
-                ));
+                let trunc = &body_text[..body_text.len().min(500)];
+                return Err(format!("Puter error {}: {}", status, trunc));
             }
 
-            return self
-                .parse_non_streaming_response(response, request, input_tokens)
-                .await;
+            return response
+                .json::<Value>()
+                .await
+                .map_err(|e| format!("Puter response parse error: {}", e));
         }
-
-        if status >= 400 {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "Puter error {}: {}",
-                status,
-                &body_text[..body_text.len().min(200)]
-            ));
-        }
-
-        self.parse_non_streaming_response(response, request, input_tokens)
-            .await
-    }
-
-    async fn parse_non_streaming_response(
-        &self,
-        response: reqwest::Response,
-        request: &MessagesRequest,
-        input_tokens: u32,
-    ) -> Result<Value, String> {
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Puter response parse error: {}", e))?;
-
-        let message_id = format!("msg_{}", Uuid::new_v4());
-        let mut content_blocks: Vec<Value> = Vec::new();
-
-        // Puter non-streaming response can be:
-        // {"message": {"content": "...", "role": "assistant"}}
-        // or direct {"text": "...", "reasoning": "..."}
-        let text = body
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|v| v.as_str())
-            .or_else(|| body.get("text").and_then(|v| v.as_str()))
-            .or_else(|| body.get("content").and_then(|v| v.as_str()));
-
-        let reasoning = body.get("reasoning").and_then(|v| v.as_str()).or_else(|| {
-            body.get("message")
-                .and_then(|m| m.get("reasoning"))
-                .and_then(|v| v.as_str())
-        });
-
-        if let Some(reasoning_text) = reasoning
-            && !reasoning_text.is_empty()
-        {
-            content_blocks.push(json!({"type": "thinking", "thinking": reasoning_text}));
-        }
-
-        if let Some(text_content) = text
-            && !text_content.is_empty()
-        {
-            // Parse out any inline <think> tags
-            let mut think_parser = ThinkTagParser::new();
-            let mut heuristic_parser = HeuristicToolParser::new();
-            let chunks = think_parser.feed(text_content);
-            let mut text_parts = Vec::new();
-
-            for c in chunks {
-                match c.content_type {
-                    ContentType::Thinking => {
-                        content_blocks.push(json!({"type": "thinking", "thinking": c.content}));
-                    }
-                    ContentType::Text => {
-                        let (filtered, tools) = heuristic_parser.feed(&c.content);
-                        if !filtered.is_empty() {
-                            text_parts.push(filtered);
-                        }
-                        for tool_use in &tools {
-                            // Flush accumulated text before tool block
-                            let combined = text_parts.join("");
-                            if !combined.is_empty() {
-                                content_blocks.push(json!({"type": "text", "text": combined}));
-                                text_parts.clear();
-                            }
-                            let mut input_map = serde_json::Map::new();
-                            for (k, v) in &tool_use.input {
-                                input_map.insert(k.clone(), Value::String(v.clone()));
-                            }
-                            content_blocks.push(json!({
-                                "type": "tool_use",
-                                "id": tool_use.id,
-                                "name": tool_use.name,
-                                "input": input_map
-                            }));
-                        }
-                    }
-                }
-            }
-
-            if let Some(remaining) = think_parser.flush() {
-                match remaining.content_type {
-                    ContentType::Thinking => {
-                        content_blocks
-                            .push(json!({"type": "thinking", "thinking": remaining.content}));
-                    }
-                    ContentType::Text => {
-                        let (filtered, _) = heuristic_parser.feed(&remaining.content);
-                        if !filtered.is_empty() {
-                            text_parts.push(filtered);
-                        }
-                    }
-                }
-            }
-
-            // Flush remaining heuristic tools
-            for tool_use in heuristic_parser.flush() {
-                let combined = text_parts.join("");
-                if !combined.is_empty() {
-                    content_blocks.push(json!({"type": "text", "text": combined}));
-                    text_parts.clear();
-                }
-                let mut input_map = serde_json::Map::new();
-                for (k, v) in &tool_use.input {
-                    input_map.insert(k.clone(), Value::String(v.clone()));
-                }
-                content_blocks.push(json!({
-                    "type": "tool_use",
-                    "id": tool_use.id,
-                    "name": tool_use.name,
-                    "input": input_map
-                }));
-            }
-
-            let combined_text = text_parts.join("");
-            if !combined_text.is_empty() {
-                content_blocks.push(json!({"type": "text", "text": combined_text}));
-            }
-        }
-
-        if content_blocks.is_empty() {
-            content_blocks.push(json!({"type": "text", "text": " "}));
-        }
-
-        let has_tool = content_blocks
-            .iter()
-            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"));
-        let stop_reason = if has_tool { "tool_use" } else { "end_turn" };
-        let output_tokens = text.map(|t| (t.len() as u32 / 4).max(1)).unwrap_or(1);
-
-        Ok(json!({
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
-            "model": request.model,
-            "content": content_blocks,
-            "stop_reason": stop_reason,
-            "stop_sequence": null,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0
-            }
-        }))
     }
 }
 
-/// Standalone login function with retry, usable from async_stream context.
+/// Obtain a valid token from cache or login.
+async fn ensure_token(
+    client: &Client,
+    cached_token: &Arc<RwLock<Option<CachedToken>>>,
+    username: &str,
+    password: &str,
+) -> Result<String, String> {
+    {
+        let cached = cached_token.read().await;
+        if let Some(ref ct) = *cached
+            && ct.obtained_at.elapsed().as_secs() < TOKEN_LIFETIME_SECS
+        {
+            return Ok(ct.token.clone());
+        }
+    }
+
+    let token = do_login(client, username, password).await?;
+    {
+        let mut cached = cached_token.write().await;
+        *cached = Some(CachedToken {
+            token: token.clone(),
+            obtained_at: Instant::now(),
+        });
+    }
+    Ok(token)
+}
+
+/// Login to Puter with exponential backoff retry.
 async fn do_login(client: &Client, username: &str, password: &str) -> Result<String, String> {
     let mut last_err = String::new();
 
