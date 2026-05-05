@@ -62,7 +62,6 @@ async fn main() {
             }
         }
     } else {
-        info!("Puter provider disabled (PUTER_API_KEY not set)");
         None
     };
 

@@ -31,10 +31,50 @@ struct CachedToken {
     obtained_at: Instant,
 }
 
+/// Puter authentication strategy.
+///
+/// - `Credentials` — login with username/password, obtain and cache a token (auto-refreshes).
+/// - `StaticToken` — use a pre-existing JWT token directly; no login, cannot auto-refresh.
+#[derive(Clone)]
+enum PuterAuth {
+    Credentials { username: String, password: String },
+    StaticToken(String),
+}
+
+impl PuterAuth {
+    fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("PUTER_API_KEY is empty".to_string());
+        }
+        // JWT tokens begin with "eyJ" (base64 encoding of `{"`).
+        if trimmed.starts_with("eyJ") {
+            return Ok(PuterAuth::StaticToken(trimmed.to_string()));
+        }
+        // Otherwise expect "username:password".
+        if let Some((user, pass)) = trimmed.split_once(':')
+            && !user.is_empty()
+            && !pass.is_empty()
+        {
+            return Ok(PuterAuth::Credentials {
+                username: user.to_string(),
+                password: pass.to_string(),
+            });
+        }
+        Err(
+            "PUTER_API_KEY must be either a JWT token (starts with 'eyJ') or 'username:password'"
+                .to_string(),
+        )
+    }
+
+    fn is_static(&self) -> bool {
+        matches!(self, PuterAuth::StaticToken(_))
+    }
+}
+
 pub struct PuterProvider {
     client: Client,
-    username: String,
-    password: String,
+    auth: PuterAuth,
     cached_token: Arc<RwLock<Option<CachedToken>>>,
     enable_tool_retry: bool,
     tool_retry_max: u32,
@@ -42,9 +82,7 @@ pub struct PuterProvider {
 
 impl PuterProvider {
     pub async fn new(credentials: &str, settings: &Settings) -> Result<Self, String> {
-        let (username, password) = credentials
-            .split_once(':')
-            .ok_or_else(|| "PUTER_API_KEY must be in format 'username:password'".to_string())?;
+        let auth = PuterAuth::parse(credentials)?;
 
         let client = Client::builder()
             .timeout(Duration::from_secs(settings.http_read_timeout))
@@ -53,11 +91,21 @@ impl PuterProvider {
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        info!("Puter provider created (login deferred to first request)");
+        match &auth {
+            PuterAuth::Credentials { username, .. } => {
+                info!(
+                    "Puter provider created with credentials for '{}' (login deferred to first request)",
+                    username
+                );
+            }
+            PuterAuth::StaticToken(_) => {
+                info!("Puter provider created with static auth token (no login required)");
+            }
+        }
+
         Ok(Self {
             client,
-            username: username.to_string(),
-            password: password.to_string(),
+            auth,
             cached_token: Arc::new(RwLock::new(None)),
             enable_tool_retry: settings.enable_tool_retry,
             tool_retry_max: settings.tool_retry_max,
@@ -124,8 +172,7 @@ impl PuterProvider {
 
         let client = self.client.clone();
         let cached_token = self.cached_token.clone();
-        let username = self.username.clone();
-        let password = self.password.clone();
+        let auth = self.auth.clone();
         let request_id = request_id.to_string();
         let enable_tool_retry = self.enable_tool_retry;
         let tool_retry_max = self.tool_retry_max;
@@ -155,8 +202,8 @@ impl PuterProvider {
                 let mut auth_attempts: u32 = 0;
 
                 'http_retry: loop {
-                    // Obtain a token (login if necessary)
-                    let token = match ensure_token(&client, &cached_token, &username, &password).await {
+                    // Obtain a token (login if necessary, or reuse static token)
+                    let token = match ensure_token(&client, &cached_token, &auth).await {
                         Ok(t) => t,
                         Err(e) => {
                             last_error = Some(format!("Puter auth failed: {}", e));
@@ -195,14 +242,28 @@ impl PuterProvider {
 
                     let status = response.status().as_u16();
 
-                    // Auth failure → invalidate token and retry once
-                    if (status == 401 || status == 403) && auth_attempts < 1 {
-                        warn!("Puter auth error ({}), invalidating token...", status);
-                        let mut cached = cached_token.write().await;
-                        *cached = None;
-                        drop(cached);
-                        auth_attempts += 1;
-                        continue 'http_retry;
+                    // Auth failure → credentials mode: invalidate cache + retry login once.
+                    //                  static token mode: cannot recover — fail fast with clear message.
+                    if status == 401 || status == 403 {
+                        if auth.is_static() {
+                            error!(
+                                "Puter static token rejected ({}). Cannot auto-refresh; update PUTER_API_KEY.",
+                                status
+                            );
+                            last_error = Some(format!(
+                                "Puter static token invalid or expired (status {}). Refresh PUTER_API_KEY.",
+                                status
+                            ));
+                            break 'http_retry;
+                        }
+                        if auth_attempts < 1 {
+                            warn!("Puter auth error ({}), invalidating token and re-logging in...", status);
+                            let mut cached = cached_token.write().await;
+                            *cached = None;
+                            drop(cached);
+                            auth_attempts += 1;
+                            continue 'http_retry;
+                        }
                     }
 
                     if status >= 400 {
@@ -693,13 +754,7 @@ impl PuterProvider {
 
         let mut auth_attempts: u32 = 0;
         loop {
-            let token = ensure_token(
-                &self.client,
-                &self.cached_token,
-                &self.username,
-                &self.password,
-            )
-            .await?;
+            let token = ensure_token(&self.client, &self.cached_token, &self.auth).await?;
 
             let envelope = Self::build_envelope(&token, args.clone());
 
@@ -719,13 +774,28 @@ impl PuterProvider {
 
             let status = response.status().as_u16();
 
-            if (status == 401 || status == 403) && auth_attempts < 1 {
-                warn!("Puter auth error ({}), invalidating token...", status);
-                let mut cached = self.cached_token.write().await;
-                *cached = None;
-                drop(cached);
-                auth_attempts += 1;
-                continue;
+            if status == 401 || status == 403 {
+                if self.auth.is_static() {
+                    error!(
+                        "Puter static token rejected ({}). Cannot auto-refresh; update PUTER_API_KEY.",
+                        status
+                    );
+                    return Err(format!(
+                        "Puter static token invalid or expired (status {}). Refresh PUTER_API_KEY.",
+                        status
+                    ));
+                }
+                if auth_attempts < 1 {
+                    warn!(
+                        "Puter auth error ({}), invalidating token and re-logging in...",
+                        status
+                    );
+                    let mut cached = self.cached_token.write().await;
+                    *cached = None;
+                    drop(cached);
+                    auth_attempts += 1;
+                    continue;
+                }
             }
 
             if status >= 400 {
@@ -843,31 +913,38 @@ fn convert_completion_to_anthropic(completion: &Value, model: &str, input_tokens
     })
 }
 
-/// Obtain a valid token from cache or login.
+/// Obtain a valid token based on the configured auth strategy.
+///
+/// - `StaticToken` → returns the provided token directly (no network call).
+/// - `Credentials` → returns cached token if still valid, otherwise logs in.
 async fn ensure_token(
     client: &Client,
     cached_token: &Arc<RwLock<Option<CachedToken>>>,
-    username: &str,
-    password: &str,
+    auth: &PuterAuth,
 ) -> Result<String, String> {
-    {
-        let cached = cached_token.read().await;
-        if let Some(ref ct) = *cached
-            && ct.obtained_at.elapsed().as_secs() < TOKEN_LIFETIME_SECS
-        {
-            return Ok(ct.token.clone());
+    match auth {
+        PuterAuth::StaticToken(token) => Ok(token.clone()),
+        PuterAuth::Credentials { username, password } => {
+            {
+                let cached = cached_token.read().await;
+                if let Some(ref ct) = *cached
+                    && ct.obtained_at.elapsed().as_secs() < TOKEN_LIFETIME_SECS
+                {
+                    return Ok(ct.token.clone());
+                }
+            }
+
+            let token = do_login(client, username, password).await?;
+            {
+                let mut cached = cached_token.write().await;
+                *cached = Some(CachedToken {
+                    token: token.clone(),
+                    obtained_at: Instant::now(),
+                });
+            }
+            Ok(token)
         }
     }
-
-    let token = do_login(client, username, password).await?;
-    {
-        let mut cached = cached_token.write().await;
-        *cached = Some(CachedToken {
-            token: token.clone(),
-            obtained_at: Instant::now(),
-        });
-    }
-    Ok(token)
 }
 
 /// Truncate a string for logging — preserves UTF-8 boundaries and adds an ellipsis.
