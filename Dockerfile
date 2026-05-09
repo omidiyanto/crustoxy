@@ -20,5 +20,6 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 ENV HOST=0.0.0.0
 ENV PORT=8082
 ENV KIMI_OAUTH_ENABLE=false
+ENV SUMOPOD_API_KEY=""
 EXPOSE 8082
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

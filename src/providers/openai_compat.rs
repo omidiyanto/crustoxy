@@ -115,14 +115,16 @@ impl OpenAICompatProvider {
                 for attempt in 0..=max_retries {
                     rate_limiter.acquire().await;
 
-                    let resp = client
+                    let req = client
                         .post(&url)
                         .header("Content-Type", "application/json")
                         .header("Authorization", format!("Bearer {}", api_key))
                         .header("Accept", "text/event-stream")
-                        .json(&current_body)
-                        .send()
-                        .await;
+                        .json(&current_body);
+
+                    info!("Sending payload to {}: {}", url, serde_json::to_string(&current_body).unwrap_or_default());
+
+                    let resp = req.send().await;
 
                     match resp {
                         Err(e) => {

@@ -164,7 +164,30 @@ pub fn convert_system_prompt(system: &Option<SystemPrompt>) -> Option<ChatMessag
     }
 }
 
-pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
+fn sanitize_schema_for_nim(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        // Remove keywords that often contain lists of dicts, crashing NIM/Moonshot backend
+        obj.remove("anyOf");
+        obj.remove("allOf");
+        obj.remove("oneOf");
+
+        // If "type" is not a string, remove it (prevents 'unhashable type: dict/list')
+        if obj.get("type").is_some_and(|v| !v.is_string()) {
+            obj.remove("type");
+        }
+
+        // Recursively sanitize all remaining values
+        for (_, v) in obj.iter_mut() {
+            sanitize_schema_for_nim(v);
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        for v in arr.iter_mut() {
+            sanitize_schema_for_nim(v);
+        }
+    }
+}
+
+pub fn convert_tools(tools: &[Tool], provider_type: &str) -> Vec<ChatTool> {
     tools
         .iter()
         .map(|t| {
@@ -181,6 +204,14 @@ pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
                     if schema.get("type").is_none() {
                         schema["type"] = serde_json::json!("object");
                     }
+
+                    if provider_type == "nvidia_nim"
+                        || provider_type == "moonshot"
+                        || provider_type == "kimi_oauth"
+                    {
+                        sanitize_schema_for_nim(&mut schema);
+                    }
+
                     Some(schema)
                 }
             } else {
@@ -250,11 +281,20 @@ pub fn build_openai_request(
     }
     messages.extend(convert_messages(&request.messages));
 
-    let tools = request.tools.as_ref().map(|t| convert_tools(t));
+    let tools = request
+        .tools
+        .as_ref()
+        .map(|t| convert_tools(t, provider_type));
     let strict_tool_choice = provider_type == "kimi_oauth"
         || provider_type == "nvidia_nim"
         || provider_type == "moonshot";
     let tool_choice = convert_tool_choice(&request.tool_choice, strict_tool_choice);
+
+    let stream_options = if provider_type == "nvidia_nim" {
+        None
+    } else {
+        Some(serde_json::json!({"include_usage": true}))
+    };
 
     ChatCompletionRequest {
         model: model_name.to_string(),
@@ -266,7 +306,7 @@ pub fn build_openai_request(
         stop: request.stop_sequences.clone(),
         tools,
         tool_choice,
-        stream_options: Some(serde_json::json!({"include_usage": true})),
+        stream_options,
     }
 }
 
