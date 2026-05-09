@@ -87,7 +87,7 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
 
 4. **First-Time Setup (Web Dashboard)**
    Open your browser and navigate to:
-   **`http://127.0.0.1:8082/ui/`**
+   **`http://127.0.0.1:8082/ui`**
    
    Configure your proxy via the **Nothing OS-styled dashboard**:
    - Add multiple API keys per provider (automatically pooled and rotated).
