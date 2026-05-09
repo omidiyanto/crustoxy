@@ -36,6 +36,9 @@ Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely in
 - **Blazing Fast & Lightweight**: Written in pure Rust using `axum`, boasting near-zero proxy latency and an extremely minimal memory footprint perfect for long-running daemonized processes.
 - **Anthropic ↔ OpenAI Compat API**: Automatically translates Anthropic's complex proprietary API requests (such as `messages`, `system`, `tools`, `thinking`) into standard, universally accepted OpenAI-compatible API requests. It then seamlessly streams the responses back using Anthropic's exact SSE (Server-Sent Events) formatting and event sequences.
 - **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Puter, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, driven directly by your simple `.env` configuration.
+- **Embedded Web UI Dashboard**: A beautifully designed "Nothing OS" style configuration panel built directly into the proxy. Manage your profiles, API keys, model mappings, and monitor live proxy health—all without restarting the server.
+- **Smart Model Auto-Routing & Fallback**: Define multiple provider/model combinations per Claude tier (`opus`, `sonnet`, `haiku`). The internal router load-balances traffic across models (Round-Robin, Random, or Least-Errors) and seamlessly falls back to the next healthy model mid-stream if a provider goes down.
+- **API Key Pooling & Rotation**: Avoid rate limits by attaching multiple API keys to a single provider. Keys are automatically cycled on each request. If a key hits a `429 Rate Limit`, it is temporarily placed on a smart cooldown and skipped until it recovers.
 - **Smart 429 Rate Limit Deflection**:
   - Proactive algorithmic sliding window rate limiter that intelligently throttles concurrent bursts *before* provider limits are hit.
   - Reactive blocking with customizable exponential backoff and jitter retries when an HTTP `429` is eventually encountered.
@@ -73,22 +76,7 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
    cd crustoxy
    cp .env.example .env
    ```
-2. **Edit `.env`**
-   Add your preferred provider API keys and setup which model you want to default to:
-   ```env
-   # Set default routing target (use puter/ prefix for Puter.com)
-   MODEL=openrouter/meta-llama/llama-3-8b-instruct:free
-
-   OPENROUTER_API_KEY=sk-or-v1-yourapikey
-   OLLAMA_BASE_URL=http://localhost:11434/v1
-
-   # Optional: enable native Puter provider integration
-   # PUTER_API_KEY=your_username:your_password
-
-   # Optional: compact Claude Code system prompts (enabled by default)
-   # ENABLE_RTK=true
-   # OVERRIDE_SYSTEM_PROMPT=Your custom system prompt here
-   ```
+   *Note: `.env` is now strictly for deployment variables (`HOST`, `PORT`, `ANTHROPIC_AUTH_TOKEN`). All proxy configuration is done through the Web UI.*
 
 3. **Build & Run Locally**
    ```bash
@@ -97,7 +85,17 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
    ```
    *The server will start on `http://127.0.0.1:8082`*.
 
-4. **Connect Claude Code via CLI**
+4. **First-Time Setup (Web Dashboard)**
+   Open your browser and navigate to:
+   **`http://127.0.0.1:8082/ui/`**
+   
+   Configure your proxy via the **Nothing OS-styled dashboard**:
+   - Add multiple API keys per provider (automatically pooled and rotated).
+   - Configure model routing per Claude tier (`opus`, `sonnet`, `haiku`).
+   - Toggle features like IP Rotation and RTK Prompt Compact.
+   - Click "Save & Apply" to hot-reload the proxy instantly.
+
+5. **Connect Claude Code via CLI**
    Set the API URL for your local Claude Code terminal session:
    ```bash
    export ANTHROPIC_AUTH_TOKEN="sk-ant-dummy"
@@ -151,51 +149,9 @@ docker-compose logs -f
 
 ---
 
-## � Puter Provider
-
-Crustoxy natively integrates with [Puter.com](https://puter.com)'s AI API, giving you access to a wide catalog of models (MoonshotAI Kimi, MiniMax, etc.) through simple username/password authentication. No external binaries or language servers required.
-
-### How it works
-1. **Auto-login** — On startup, Crustoxy authenticates with Puter using the credentials in `PUTER_API_KEY` and obtains a session token.
-2. **Token caching** — The token is cached in memory for ~23 hours. Re-authentication only happens when the token expires or the process/container restarts. Crustoxy remains fully stateless (no files written).
-3. **Auth retry** — If a request fails with 401/403, Crustoxy automatically re-authenticates and retries the request once.
-4. **Streaming** — Puter streams newline-delimited JSON objects with `{"type": "reasoning"}` and `{"type": "text"}` chunks. Crustoxy maps these to native Anthropic `thinking` and `text` content blocks in real-time.
-5. **Think tag parsing** — Inline `<think>` / `<thought>` tags in text content are also extracted into separate thinking blocks.
-
-### Quick setup
-
-```bash
-# Set your Puter credentials (format: username:password)
-PUTER_API_KEY=your_username:your_password
-
-# Route any model slot to a Puter model
-MODEL=puter/moonshotai/kimi-k2.6
-# or per-tier:
-MODEL_SONNET=puter/minimax/minimax-m2.7
-MODEL_OPUS=puter/moonshotai/kimi-k2.6
-MODEL_HAIKU=puter/minimax/minimax-m2.7
-```
-
-### Health check
-
-The `/health` endpoint reports Puter status:
-```json
-{
-  "status": "healthy",
-  "features": {
-    "puter": "enabled",
-    "rtk": true
-  }
-}
-```
-- `disabled` — `PUTER_API_KEY` is not set.
-- `enabled` — Puter provider is initialized and ready.
-
----
-
 ## ⚙️ Configuration Parameters
 
-You can fine-tune Crustoxy to fit your exact infrastructure requirements via the `.env` file. Below are the configurations and what they govern:
+You can fine-tune Crustoxy to fit your exact infrastructure requirements via the **Web UI Dashboard** (which saves to `~/.config/crustoxy/config.toml`). Below are the key configurations and what they govern:
 
 ### 1. Server Configuration
 - `HOST` *(default: `0.0.0.0`)*: The network interface the proxy runs on.
@@ -224,11 +180,7 @@ Crustoxy employs algorithmic Sliding Window limits to prevent your account from 
 - `ENABLE_RTK` *(default: `true`)*: When enabled, Claude Code's massive default system prompt (4,000–8,000 tokens) is automatically compacted into a concise RTK-style factual summary (200–300 tokens). Essential metadata (workspace path, OS platform, OS version) is preserved; repetitive instructional boilerplate is stripped.
 - `OVERRIDE_SYSTEM_PROMPT`: Leave blank to use RTK-compacted prompt. Set to any text string to fully replace the system prompt sent to the provider, bypassing both the original and the RTK-compacted version.
 
-### 7. Puter Provider & Kimi OAuth
-- `PUTER_API_KEY`: Puter.com credentials in `username:password` format. On startup, Crustoxy logs in and obtains a session token which is cached in memory for ~23 hours. Re-authentication happens automatically on token expiry or process restart.
-- `KIMI_OAUTH_ENABLE` *(default: `false`)*: Activates the native Device-Code OAuth flow for Moonshot Kimi. When `true`, proxy will halt on startup to present a browser login link, capturing the `kimi:coding_api` access token locally to disk (`~/.config/crustoxy/kimi_oauth/auth.json`).
-
-### 8. Optimizations & Safety Nets
+### 7. Optimizations & Safety Nets
 - `ENABLE_NETWORK_PROBE_MOCK` / `ENABLE_TITLE_GENERATION_SKIP` / `ENABLE_SUGGESTION_MODE_SKIP` / `ENABLE_FILEPATH_EXTRACTION_MOCK`: Set to `true` to intercept internal telemetry and UI-aesthetic requests heavily spammed by Claude Code. Crustoxy mocks perfect responses instantly, slashing your API token costs heavily.
 - `ENABLE_TOOL_RETRY` *(default: `true`)*: Activates the active Auto-Retry Pipeline. When set to true, if a model writes sentences indicating it wants to use a tool (e.g. "Let me run a command") but fails to actually output the structured tool JSON, Crustoxy will silently push the context back and force the model to retry.
 - `TOOL_RETRY_MAX` *(default: `2`)*: The maximum amount of times Crustoxy is allowed to automatically retry the provider per single user prompt.
@@ -237,29 +189,29 @@ Crustoxy employs algorithmic Sliding Window limits to prevent your account from 
 
 ## Supported Built-in Providers
 
-No need to figure out endpoint definitions. Just pop in your `API_KEY` for any of the below.
+No need to figure out endpoint definitions. Just enter your API keys into the Web UI for any of the below. Multiple keys are supported per provider for automatic load balancing.
 
-| Provider | Env Prefix | Built-in Base URL |
-| :--- | :--- | :--- |
-| **Puter.com** | `PUTER_API_KEY` | `https://api.puter.com/drivers/call` |
-| **OpenAI** | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
-| **OpenRouter** | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
-| **Groq** | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
-| **DeepSeek** | `DEEPSEEK_API_KEY` | `https://api.deepseek.com/v1` |
-| **Google Gemini** | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/v1beta/openai` |
-| **Together AI** | `TOGETHER_API_KEY` | `https://api.together.xyz/v1` |
-| **Hugging Face** | `HUGGINGFACE_API_KEY` | `https://router.huggingface.co/v1` |
-| **Mistral AI** | `MISTRAL_API_KEY` | `https://api.mistral.ai/v1` |
-| **Perplexity** | `PERPLEXITY_API_KEY`| `https://api.perplexity.ai` |
-| **Fireworks AI** | `FIREWORKS_API_KEY` | `https://api.fireworks.ai/inference/v1` |
-| **DeepInfra** | `DEEPINFRA_API_KEY` | `https://api.deepinfra.com/v1/openai` |
-| **Ollama** | `OLLAMA_API_KEY` | `http://localhost:11434/v1` |
-| **Kimi OAuth** | `KIMI_OAUTH_ENABLE` | `https://api.kimi.com/coding/v1` |
-| **SumoPod** | `SUMOPOD_API_KEY` | `https://ai.sumopod.com/v1` |
-| **Cloudflare AI** | `CLOUDFLARE_API_KEY` | `https://api.cloudflare.com/client/v4/accounts` |
-| *...and 10+ more local/cloud services!* | | |
+| Provider | Built-in Base URL |
+| :--- | :--- |
+| **Puter.com** | `https://api.puter.com/drivers/call` |
+| **OpenAI** | `https://api.openai.com/v1` |
+| **OpenRouter** | `https://openrouter.ai/api/v1` |
+| **Groq** | `https://api.groq.com/openai/v1` |
+| **DeepSeek** | `https://api.deepseek.com/v1` |
+| **Google Gemini** | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| **Together AI** | `https://api.together.xyz/v1` |
+| **Hugging Face** | `https://router.huggingface.co/v1` |
+| **Mistral AI** | `https://api.mistral.ai/v1` |
+| **Perplexity** | `https://api.perplexity.ai` |
+| **Fireworks AI** | `https://api.fireworks.ai/inference/v1` |
+| **DeepInfra** | `https://api.deepinfra.com/v1/openai` |
+| **Ollama** | `http://localhost:11434/v1` |
+| **Kimi OAuth** | `https://api.kimi.com/coding/v1` |
+| **SumoPod** | `https://ai.sumopod.com/v1` |
+| **Cloudflare AI** | `https://api.cloudflare.com/client/v4/accounts` |
+| *...and 10+ more local/cloud services!* | |
 
-*If you need to use a custom provider, just prefix it with `CUSTOM` inside `.env`.*
+*If you need to use a custom provider, simply override the Base URL in the Web UI Settings tab.*
 
 ---
 

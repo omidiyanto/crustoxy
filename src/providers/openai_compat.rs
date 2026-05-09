@@ -12,6 +12,8 @@ use crate::config::{Settings, get_provider_api_key, get_provider_base_url};
 use crate::converter::{build_openai_request, map_stop_reason};
 use crate::heuristic_tool_parser::HeuristicToolParser;
 use crate::ip_rotator;
+use crate::key_pool::KeyPoolManager;
+use crate::model_router::ModelRouter;
 use crate::models::anthropic::MessagesRequest;
 use crate::models::openai::{ChatCompletionChunk, ChatMessage};
 use crate::rate_limiter::RateLimiter;
@@ -56,22 +58,16 @@ impl OpenAICompatProvider {
         request: &MessagesRequest,
         input_tokens: u32,
         request_id: &str,
+        key_pool: Arc<KeyPoolManager>,
+        model_router: Arc<ModelRouter>,
     ) -> impl Stream<Item = String> + use<> {
-        let resolved = request
+        let initial_resolved = request
             .resolved_provider_model
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
-        let provider_type = Settings::parse_provider_type(&resolved).to_string();
-        let model_name = Settings::parse_model_name(&resolved).to_string();
-        let base_url = get_provider_base_url(&provider_type);
-        let api_key = get_provider_api_key(&provider_type).unwrap_or_default();
         let request_model = request.model.clone();
-
         let message_id = format!("msg_{}", Uuid::new_v4());
-        let body = build_openai_request(request, &model_name, &provider_type);
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-
         let request_id = request_id.to_string();
         let rate_limiter = self.rate_limiter.clone();
         let client = self.client.clone();
@@ -79,13 +75,18 @@ impl OpenAICompatProvider {
         let enable_tool_retry = self.enable_tool_retry;
         let tool_retry_max = self.tool_retry_max;
 
+        let initial_body = build_openai_request(
+            request,
+            Settings::parse_model_name(&initial_resolved),
+            Settings::parse_provider_type(&initial_resolved),
+        );
+
         info!(
-            "STREAM: request_id={} provider={} model={} msgs={} tools={}",
+            "STREAM: request_id={} initial_model={} msgs={} tools={}",
             request_id,
-            provider_type,
-            model_name,
-            body.messages.len(),
-            body.tools.as_ref().map_or(0, |t| t.len()),
+            initial_resolved,
+            initial_body.messages.len(),
+            initial_body.tools.as_ref().map_or(0, |t| t.len()),
         );
 
         // std::fs::write(
@@ -95,7 +96,7 @@ impl OpenAICompatProvider {
         // .ok();
 
         async_stream::stream! {
-            let mut sse = SSEBuilder::new(message_id, request_model, input_tokens);
+            let mut sse = SSEBuilder::new(message_id, request_model.clone(), input_tokens);
             yield sse.message_start();
 
             let _permit = rate_limiter.acquire_concurrency().await;
@@ -108,7 +109,8 @@ impl OpenAICompatProvider {
             // When enable_tool_retry is true, we allow up to tool_retry_max + 1 attempts.
             let max_tool_attempts: u32 = if enable_tool_retry { tool_retry_max + 1 } else { 1 };
             let mut tool_attempt: u32 = 0;
-            let mut current_body = body.clone();
+            let mut current_body = initial_body;
+            let mut resolved_spec = initial_resolved;
             let mut accumulated_all_text = String::new();
             let mut had_tool_call = false;
             #[allow(unused_assignments)]
@@ -117,9 +119,18 @@ impl OpenAICompatProvider {
             let mut final_output_tokens: Option<u32> = None;
 
             'tool_retry: while tool_attempt < max_tool_attempts {
+                let provider_type = Settings::parse_provider_type(&resolved_spec).to_string();
+                let base_url = get_provider_base_url(&provider_type);
+                let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
                 // ── HTTP retry loop (network errors, 429s, 5xx) ──────────
                 for attempt in 0..=max_retries {
                     rate_limiter.acquire().await;
+
+                    let key_ep = key_pool.acquire(&provider_type).await;
+                    let api_key = key_ep.as_ref()
+                        .map(|ep| ep.key.clone())
+                        .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
 
                     let req = client
                         .post(&url)
@@ -128,12 +139,13 @@ impl OpenAICompatProvider {
                         .header("Accept", "text/event-stream")
                         .json(&current_body);
 
-                    // info!("Sending payload to {}: {}", url, serde_json::to_string(&current_body).unwrap_or_default());
-
                     let resp = req.send().await;
 
                     match resp {
                         Err(e) => {
+                            if let Some(ep) = &key_ep {
+                                key_pool.report_error(ep, false).await;
+                            }
                             error!("STREAM_ERROR: request_id={} attempt={} error={}", request_id, attempt, e);
                             last_error = Some(format!("Connection error: {}", e));
                             if attempt < max_retries {
@@ -142,11 +154,22 @@ impl OpenAICompatProvider {
                                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                 continue;
                             }
+
+                            // Fallback on network error
+                            if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
+                                warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
+                                resolved_spec = next_ep.full_spec.clone();
+                                current_body.model = next_ep.model_name.clone();
+                                continue 'tool_retry;
+                            }
                         }
                         Ok(response) => {
                             let status = response.status().as_u16();
 
                             if status == 429 {
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_error(ep, true).await;
+                                }
                                 warn!("Rate limited (429): request_id={} attempt={}", request_id, attempt);
 
                                 if attempt < max_retries {
@@ -172,10 +195,20 @@ impl OpenAICompatProvider {
                                 }
 
                                 last_error = Some("Rate limit exceeded. Retries exhausted.".to_string());
+                                // Try model fallback on 429 after retries
+                                if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
+                                    warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
+                                    resolved_spec = next_ep.full_spec.clone();
+                                    current_body.model = next_ep.model_name.clone();
+                                    continue 'tool_retry;
+                                }
                                 break;
                             }
 
                             if status >= 400 {
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_error(ep, false).await;
+                                }
                                 let body_text = response.text().await.unwrap_or_default();
                                 error!("Provider error {}: {}", status, body_text);
 
@@ -199,10 +232,23 @@ impl OpenAICompatProvider {
                                     tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                     continue;
                                 }
+
+                                // Model fallback on hard errors
+                                if attempt == max_retries
+                                    && let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await
+                                {
+                                    warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
+                                    resolved_spec = next_ep.full_spec.clone();
+                                    current_body.model = next_ep.model_name.clone();
+                                    continue 'tool_retry;
+                                }
                                 break;
                             }
 
                             // ── Successful response: process stream ──────────
+                            if let Some(ep) = &key_ep {
+                                key_pool.report_success(ep, 0).await; // Can pass real latency here later
+                            }
                             let mut think_parser = ThinkTagParser::new();
                             let mut heuristic_parser = HeuristicToolParser::new();
                             let mut finish_reason: Option<String> = None;

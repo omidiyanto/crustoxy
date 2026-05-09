@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use tracing::{debug, trace};
 
 use axum::body::Body;
@@ -12,21 +13,27 @@ use uuid::Uuid;
 use crate::auth::validate_api_key;
 use crate::config::Settings;
 use crate::converter::count_request_tokens;
+use crate::key_pool::KeyPoolManager;
+use crate::model_router::ModelRouter;
 use crate::models::anthropic::{
     MessagesRequest, SystemPrompt, TokenCountRequest, extract_text_from_system,
 };
 use crate::optimization::try_optimizations;
+use crate::panel_config::PanelConfig;
 use crate::providers::OpenAICompatProvider;
 use crate::providers::PuterProvider;
 use crate::rtk;
 
+/// Shared application state with hot-reloadable configuration.
 pub struct AppState {
-    pub settings: Settings,
+    pub settings: ArcSwap<Settings>,
+    pub panel_config: ArcSwap<PanelConfig>,
+    pub key_pool_manager: Arc<KeyPoolManager>,
+    pub model_router: Arc<ModelRouter>,
     pub provider: OpenAICompatProvider,
-    pub puter_provider: Option<std::sync::Arc<PuterProvider>>,
-    pub kimi_oauth_provider:
-        Option<std::sync::Arc<crate::providers::kimi_oauth::KimiOauthProvider>>,
-    pub cloudflare_provider: Option<std::sync::Arc<crate::providers::CloudflareProvider>>,
+    pub puter_provider: Option<Arc<PuterProvider>>,
+    pub kimi_oauth_provider: Option<Arc<crate::providers::kimi_oauth::KimiOauthProvider>>,
+    pub cloudflare_provider: Option<Arc<crate::providers::CloudflareProvider>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -52,7 +59,8 @@ pub async fn create_message(
         "Incoming request payload: {}",
         serde_json::to_string(&request).unwrap_or_default()
     );
-    if let Err(r) = check_auth(&headers, &state.settings) {
+    let settings = state.settings.load();
+    if let Err(r) = check_auth(&headers, &settings) {
         return r;
     }
 
@@ -67,19 +75,23 @@ pub async fn create_message(
             .into_response();
     }
 
+    // Resolve model via ModelRouter (multi-model routing)
     request.original_model = Some(request.model.clone());
-    let resolved = state.settings.resolve_model(&request.model);
+    let resolved = match state.model_router.resolve(&request.model).await {
+        Some(r) => r.endpoint.full_spec.clone(),
+        None => settings.resolve_model(&request.model),
+    };
     request.resolved_provider_model = Some(resolved.clone());
     request.model = Settings::parse_model_name(&resolved).to_string();
 
     // Apply system prompt transformations (RTK compaction / override)
-    if state.settings.override_system_prompt.is_some() || state.settings.enable_rtk {
+    if settings.override_system_prompt.is_some() || settings.enable_rtk {
         let sys_text = extract_text_from_system(&request.system);
         if !sys_text.is_empty() {
             let transformed = rtk::apply_system_prompt_transform(
                 &sys_text,
-                &state.settings.override_system_prompt,
-                state.settings.enable_rtk,
+                &settings.override_system_prompt,
+                settings.enable_rtk,
             );
 
             let orig_len = sys_text.len();
@@ -97,14 +109,14 @@ pub async fn create_message(
         }
     }
 
-    if let Some(optimized) = try_optimizations(&request, &state.settings) {
+    if let Some(optimized) = try_optimizations(&request, &settings) {
         return Json(optimized).into_response();
     }
 
     let request_id = format!("req_{}", &Uuid::new_v4().to_string()[..12]);
     let input_tokens = count_request_tokens(&request);
 
-    // Check if this request should go to the Puter provider
+    // Check if this request should go to a special provider
     let provider_type = request
         .resolved_provider_model
         .as_deref()
@@ -264,10 +276,14 @@ pub async fn create_message(
         };
     }
 
-    // Default: SSE streaming path (existing behavior, unchanged)
-    let stream = state
-        .provider
-        .stream_response(&request, input_tokens, &request_id);
+    // Default: SSE streaming path
+    let stream = state.provider.stream_response(
+        &request,
+        input_tokens,
+        &request_id,
+        state.key_pool_manager.clone(),
+        state.model_router.clone(),
+    );
 
     let body_stream = tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
 
@@ -286,7 +302,8 @@ pub async fn count_tokens(
     headers: HeaderMap,
     Json(request): Json<TokenCountRequest>,
 ) -> Response {
-    if let Err(r) = check_auth(&headers, &state.settings) {
+    let settings = state.settings.load();
+    if let Err(r) = check_auth(&headers, &settings) {
         return r;
     }
 
@@ -315,7 +332,9 @@ pub async fn count_tokens(
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let provider_type = Settings::parse_provider_type(&state.settings.model);
+    let settings = state.settings.load();
+    let config = state.panel_config.load();
+    let provider_type = Settings::parse_provider_type(&settings.model);
 
     let puter_status = if state.puter_provider.is_some() {
         "enabled"
@@ -337,13 +356,14 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 
     Json(json!({
         "status": "healthy",
-        "model": state.settings.model,
+        "model": settings.model,
         "provider": provider_type,
         "version": env!("CARGO_PKG_VERSION"),
+        "active_profile": config.general.active_profile,
         "features": {
-            "ip_rotation": state.settings.enable_ip_rotation,
-            "tool_retry": state.settings.enable_tool_retry,
-            "rtk": state.settings.enable_rtk,
+            "ip_rotation": settings.enable_ip_rotation,
+            "tool_retry": settings.enable_tool_retry,
+            "rtk": settings.enable_rtk,
             "puter": puter_status,
             "kimi_oauth": kimi_status,
             "cloudflare": cloudflare_status,
@@ -352,15 +372,16 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 }
 
 pub async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Err(r) = check_auth(&headers, &state.settings) {
+    let settings = state.settings.load();
+    if let Err(r) = check_auth(&headers, &settings) {
         return r;
     }
 
-    let provider_type = Settings::parse_provider_type(&state.settings.model);
+    let provider_type = Settings::parse_provider_type(&settings.model);
     Json(json!({
         "status": "ok",
         "provider": provider_type,
-        "model": state.settings.model,
+        "model": settings.model,
     }))
     .into_response()
 }

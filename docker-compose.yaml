@@ -9,7 +9,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./crustoxy-data:/root/.config/crustoxy
+      - ./data:/root/.config/crustoxy
     # Note: NET_ADMIN capability and /dev/net/tun device are required 
     # for Cloudflare WARP to properly establish a connection inside the container.
     cap_add:
