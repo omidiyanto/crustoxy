@@ -50,7 +50,7 @@ const SETUP_BANNER: &str = "\n\
   No configuration found.\n\
   \n\
   Open the dashboard to configure:\n\
-  → \x1b[4;36mhttp://{}:{}/ui/\x1b[0m\n\
+  → \x1b[4;36mhttp://{}:{}/ui\x1b[0m\n\
   \n\
   Set up your models and API keys,\n\
   then click \x1b[1mSAVE & APPLY\x1b[0m to begin.\n";
