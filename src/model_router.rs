@@ -75,14 +75,16 @@ impl ModelRouter {
         let tier = detect_tier(claude_model);
         let tiers = self.tiers.read().await;
 
-        let endpoints = tiers.get(&tier).or_else(|| tiers.get("default"))?;
+        let (resolved_tier, endpoints) = tiers
+            .get_key_value(&tier)
+            .or_else(|| tiers.get_key_value("default"))?;
         if endpoints.is_empty() {
             return None;
         }
 
         let strategy = *self.strategy.read().await;
         let endpoint = match strategy {
-            RoutingStrategy::RoundRobin => self.select_round_robin(&tier, endpoints).await,
+            RoutingStrategy::RoundRobin => self.select_round_robin(resolved_tier, endpoints).await,
             RoutingStrategy::Random => self.select_random(endpoints).await,
             RoutingStrategy::LeastErrors => self.select_least_errors(endpoints).await,
         }?;

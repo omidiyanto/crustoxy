@@ -410,7 +410,7 @@ mod tests {
         );
 
         // Mark "bad" (index 1) as rate-limited
-        let bad = pool.acquire().await.unwrap(); // gets "good" (idx 0)
+        let _good = pool.acquire().await.unwrap(); // gets "good" (idx 0)
         let bad = pool.acquire().await.unwrap(); // gets "bad" (idx 1)
         pool.report_error(&bad, true).await;
 
