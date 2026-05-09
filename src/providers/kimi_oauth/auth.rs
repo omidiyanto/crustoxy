@@ -159,16 +159,14 @@ impl AuthManager {
     }
 
     async fn refresh_now(&self, refresh_token: &str) -> Result<StoredAuth, String> {
-        let payload = serde_json::json!({
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        });
-
         let resp = self
             .client
             .post(format!("{}/api/oauth/token", oauth_host()))
-            .json(&payload)
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ])
             .send()
             .await
             .map_err(|e| format!("Refresh failed: {}", e))?;
@@ -199,17 +197,17 @@ impl AuthManager {
 }
 
 pub async fn run_device_login(client: &Client) -> Result<TokenResponse, String> {
-    let payload = serde_json::json!({
-        "client_id": CLIENT_ID,
-        "scope": "kimi:coding_api",
-    });
-
     let resp = client
         .post(format!("{}/api/oauth/device_authorization", oauth_host()))
-        .json(&payload)
+        .form(&[("client_id", CLIENT_ID)])
         .send()
         .await
         .map_err(|e| format!("Device auth request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let err_body = resp.text().await.unwrap_or_default();
+        return Err(format!("Device auth rejected: {}", err_body));
+    }
 
     let auth_info: DeviceAuthResponse = resp
         .json()
@@ -228,15 +226,13 @@ pub async fn run_device_login(client: &Client) -> Result<TokenResponse, String> 
         tokio::time::sleep(tokio::time::Duration::from_secs(auth_info.interval)).await;
         attempts += 1;
 
-        let token_payload = serde_json::json!({
-            "client_id": CLIENT_ID,
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "device_code": auth_info.device_code,
-        });
-
         let token_resp = client
             .post(format!("{}/api/oauth/token", oauth_host()))
-            .json(&token_payload)
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", &auth_info.device_code),
+            ])
             .send()
             .await;
 

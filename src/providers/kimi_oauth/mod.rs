@@ -23,6 +23,7 @@ pub async fn bootstrap_if_enabled(
 
     let client = Client::builder()
         .timeout(Duration::from_secs(300))
+        .default_headers(auth::build_common_headers())
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 

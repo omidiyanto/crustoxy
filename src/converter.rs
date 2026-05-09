@@ -164,21 +164,111 @@ pub fn convert_system_prompt(system: &Option<SystemPrompt>) -> Option<ChatMessag
     }
 }
 
+/// Aggressively sanitize JSON Schema for NIM/Moonshot backends.
+///
+/// NIM's Python parser crashes with `unhashable type: 'dict'` when it encounters
+/// dict values in positions it tries to hash (e.g. as set elements or dict keys).
+/// This strips ALL known problematic constructs:
+/// - Composition keywords: anyOf, allOf, oneOf (contain arrays of dicts)
+/// - Reference keywords: $schema, $defs, $ref, definitions
+/// - Non-string `type` values (e.g. `["string", "null"]`)
+/// - `default` values that are objects or arrays
+/// - `examples` (array of potentially complex values)
+/// - `const` values that are objects or arrays
+/// - `enum` entries that are objects (keep only primitive enum values)
+/// - `not` keyword (contains a dict)
+/// - `if`/`then`/`else` keywords (contain dicts)
+/// - `prefixItems` (array of dicts, tuple validation)
 fn sanitize_schema_for_nim(schema: &mut Value) {
     if let Some(obj) = schema.as_object_mut() {
-        // Remove keywords that often contain lists of dicts, crashing NIM/Moonshot backend
+        // Remove composition keywords (arrays of dicts)
         obj.remove("anyOf");
         obj.remove("allOf");
         obj.remove("oneOf");
+        obj.remove("not");
 
-        // If "type" is not a string, remove it (prevents 'unhashable type: dict/list')
+        // Remove reference/meta keywords
+        obj.remove("$schema");
+        obj.remove("$defs");
+        obj.remove("$ref");
+        obj.remove("definitions");
+        obj.remove("$id");
+        obj.remove("$anchor");
+        obj.remove("$dynamicRef");
+        obj.remove("$dynamicAnchor");
+
+        // Remove conditional keywords (contain dicts)
+        obj.remove("if");
+        obj.remove("then");
+        obj.remove("else");
+
+        // Remove tuple validation (array of dicts)
+        obj.remove("prefixItems");
+
+        // Remove examples (array of potentially complex values)
+        obj.remove("examples");
+
+        // If "type" is not a simple string, try to extract first string from array or remove
         if obj.get("type").is_some_and(|v| !v.is_string()) {
-            obj.remove("type");
+            let replacement = obj
+                .get("type")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.iter().find_map(|v| v.as_str()))
+                .map(|s| Value::String(s.to_string()));
+            match replacement {
+                Some(val) => {
+                    obj.insert("type".to_string(), val);
+                }
+                None => {
+                    obj.remove("type");
+                }
+            }
+        }
+
+        // Remove `default` if it's an object or array (unhashable)
+        if obj
+            .get("default")
+            .is_some_and(|v| v.is_object() || v.is_array())
+        {
+            obj.remove("default");
+        }
+
+        // Remove `const` if it's an object or array (unhashable)
+        if obj
+            .get("const")
+            .is_some_and(|v| v.is_object() || v.is_array())
+        {
+            obj.remove("const");
+        }
+
+        // Sanitize `enum`: remove any dict/array entries, keep only primitives
+        let enum_is_empty = obj
+            .get_mut("enum")
+            .and_then(|v| v.as_array_mut())
+            .map(|arr| {
+                arr.retain(|v| !v.is_object() && !v.is_array());
+                arr.is_empty()
+            })
+            .unwrap_or(false);
+        if enum_is_empty {
+            obj.remove("enum");
+        }
+
+        // Remove `additionalProperties` if it's a complex object (not a bool)
+        // Keep it if it's `true` or `false`
+        if obj
+            .get("additionalProperties")
+            .is_some_and(|v| v.is_object())
+        {
+            obj.insert("additionalProperties".to_string(), Value::Bool(false));
         }
 
         // Recursively sanitize all remaining values
-        for (_, v) in obj.iter_mut() {
-            sanitize_schema_for_nim(v);
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            if let Some(v) = obj.get_mut(&key) {
+                sanitize_schema_for_nim(v);
+            }
         }
     } else if let Some(arr) = schema.as_array_mut() {
         for v in arr.iter_mut() {

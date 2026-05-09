@@ -88,6 +88,12 @@ impl OpenAICompatProvider {
             body.tools.as_ref().map_or(0, |t| t.len()),
         );
 
+        std::fs::write(
+            "openai_payload_debug.json",
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
+        )
+        .ok();
+
         async_stream::stream! {
             let mut sse = SSEBuilder::new(message_id, request_model, input_tokens);
             yield sse.message_start();
@@ -172,6 +178,15 @@ impl OpenAICompatProvider {
                             if status >= 400 {
                                 let body_text = response.text().await.unwrap_or_default();
                                 error!("Provider error {}: {}", status, body_text);
+
+                                // Capture payload that triggers unhashable dict error
+                                if status == 500 && body_text.contains("unhashable") {
+                                    error!("Captured unhashable-error payload → failed_payload.json");
+                                    std::fs::write(
+                                        "failed_payload.json",
+                                        serde_json::to_string_pretty(&current_body).unwrap_or_default(),
+                                    ).ok();
+                                }
 
                                 let provider_msg = extract_provider_error(&body_text);
                                 last_error = Some(format!(
@@ -575,6 +590,12 @@ impl OpenAICompatProvider {
 
         let _permit = self.rate_limiter.acquire_concurrency().await;
         self.rate_limiter.acquire().await;
+
+        std::fs::write(
+            "openai_payload_debug_nonstream.json",
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
+        )
+        .ok();
 
         let response = self
             .client
