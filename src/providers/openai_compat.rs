@@ -122,7 +122,7 @@ impl OpenAICompatProvider {
                         .header("Accept", "text/event-stream")
                         .json(&current_body);
 
-                    info!("Sending payload to {}: {}", url, serde_json::to_string(&current_body).unwrap_or_default());
+                    // info!("Sending payload to {}: {}", url, serde_json::to_string(&current_body).unwrap_or_default());
 
                     let resp = req.send().await;
 
