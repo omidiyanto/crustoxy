@@ -199,7 +199,7 @@ async fn main() {
     // ── Start server ─────────────────────────────────────────────────────
     let addr = format!("{}:{}", settings.host, settings.port);
     info!("Crustoxy starting on {}", addr);
-    info!("Dashboard: http://{}:{}/ui/", settings.host, settings.port);
+    info!("Dashboard: http://{}:{}/ui", settings.host, settings.port);
     info!("Default model: {}", settings.model);
     info!(
         "IP rotation: {}",

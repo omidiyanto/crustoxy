@@ -163,24 +163,32 @@ Claude Code inherently delegates tasks between `opus`, `sonnet`, and `haiku` mod
 - `MODEL_OPUS` / `MODEL_SONNET` / `MODEL_HAIKU`: Format using `provider_id/model_id` (e.g., `groq/llama3-8b-8192`).
 - `MODEL`: The fallback unified model router if a specific subset isn't defined.
 
-### 3. Rate Limiting & Concurrency
+### 3. Routing & Load Balancing Strategies
+When configuring multiple models per tier or multiple API keys per provider (separated by newlines in the Web UI), Crustoxy uses your chosen routing strategy to distribute the load:
+- **Round Robin** (`round_robin`): Iterates sequentially through the list of available keys or models. Ensures an even and predictable distribution of requests.
+- **Least Errors** (`least_errors`): Dynamically tracks failure rates and selects the key or model with the lowest historical error count, maximizing overall reliability.
+- **Random** (`random`): Randomly selects an available key or model for each request.
+
+*(Note: If a key hits its rate limit or consecutive error threshold, it is automatically placed on a temporary cooldown before rejoining the active pool).*
+
+### 4. Rate Limiting & Concurrency
 Crustoxy employs algorithmic Sliding Window limits to prevent your account from hitting provider throttles too aggressively.
 - `PROVIDER_RATE_LIMIT` *(default: `40`)*: The amount of requests allowed during the window.
 - `PROVIDER_RATE_WINDOW` *(default: `60`)*: The timeframe in seconds where the rate limit applies.
 - `PROVIDER_MAX_CONCURRENCY` *(default: `5`)*: Hard caps how many simultaneous HTTP requests can be inflight to the provider. Any excess requests will cleanly wait in queue.
 
-### 4. HTTP Settings
+### 5. HTTP Settings
 - `HTTP_READ_TIMEOUT` *(default: `300`)*: Max time in seconds to keep a stream connection alive while waiting for inference tokens. High values are recommended for deep reasoning models.
 - `HTTP_CONNECT_TIMEOUT` *(default: `10`)*: Max time in seconds allowed to establish the initial HTTP handshake with a provider.
 
-### 5. IP Rotation
+### 6. IP Rotation
 - `ENABLE_IP_ROTATION` *(default: `true`)*: If set to true, seamlessly communicates with `warp-cli` to switch IP allocations when a provider enforces persistent IP-based `429` blocks. (Requires Cloudflare WARP daemon).
 
-### 6. RTK System Prompt Optimization
+### 7. RTK System Prompt Optimization
 - `ENABLE_RTK` *(default: `true`)*: When enabled, Claude Code's massive default system prompt (4,000–8,000 tokens) is automatically compacted into a concise RTK-style factual summary (200–300 tokens). Essential metadata (workspace path, OS platform, OS version) is preserved; repetitive instructional boilerplate is stripped.
 - `OVERRIDE_SYSTEM_PROMPT`: Leave blank to use RTK-compacted prompt. Set to any text string to fully replace the system prompt sent to the provider, bypassing both the original and the RTK-compacted version.
 
-### 7. Optimizations & Safety Nets
+### 8. Optimizations & Safety Nets
 - `ENABLE_NETWORK_PROBE_MOCK` / `ENABLE_TITLE_GENERATION_SKIP` / `ENABLE_SUGGESTION_MODE_SKIP` / `ENABLE_FILEPATH_EXTRACTION_MOCK`: Set to `true` to intercept internal telemetry and UI-aesthetic requests heavily spammed by Claude Code. Crustoxy mocks perfect responses instantly, slashing your API token costs heavily.
 - `ENABLE_TOOL_RETRY` *(default: `true`)*: Activates the active Auto-Retry Pipeline. When set to true, if a model writes sentences indicating it wants to use a tool (e.g. "Let me run a command") but fails to actually output the structured tool JSON, Crustoxy will silently push the context back and force the model to retry.
 - `TOOL_RETRY_MAX` *(default: `2`)*: The maximum amount of times Crustoxy is allowed to automatically retry the provider per single user prompt.

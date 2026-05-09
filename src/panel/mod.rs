@@ -71,6 +71,10 @@ async fn serve_index(State(state): State<Arc<AppState>>) -> Response {
 
 /// Serve a static asset file (CSS, JS, SVG, etc.).
 async fn serve_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    if path.is_empty() {
+        return axum::response::Redirect::permanent("/ui").into_response();
+    }
+
     match PanelAssets::get(&path) {
         Some(file) => {
             let mime = mime_guess::from_path(&path)

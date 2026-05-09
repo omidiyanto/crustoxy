@@ -8,7 +8,7 @@
   let authToken = localStorage.getItem("crustoxy_token") || "";
   let config = null;
   let status = null;
-  let currentPage = "dashboard";
+  let currentPage = null;
   let providers = [];
 
   const $ = (s) => document.querySelector(s);
@@ -155,7 +155,10 @@
   // ── Navigation ───────────────────────────────────────────────────────────
 
   function renderPage(page) {
+    if (currentPage === page) return;
     currentPage = page;
+    localStorage.setItem('crustoxy_page', page);
+
     $$(".nav-item").forEach((el) => {
       el.classList.toggle("active", el.dataset.page === page);
     });
@@ -179,7 +182,7 @@
     const map = {
       dashboard: "Dashboard",
       models: "Model Mapping",
-      keys: "API Keys",
+      keys: "Providers",
       features: "Features",
       routing: "Routing Strategy",
       profiles: "Profiles",
@@ -268,24 +271,117 @@
     const p = activeProfile();
     if (!p) return;
     const tiers = ["default", "opus", "sonnet", "haiku"];
-    let html = '<div class="form-hint" style="margin-bottom:16px">Configure model mappings per Claude tier. Multiple models enable auto-routing.</div>';
+
+    let html = '<div class="form-hint" style="margin-bottom:16px">Select a Claude tier to view and configure its model routing map.</div>';
+    html += '<div class="dashboard-grid">';
+
     for (const tier of tiers) {
-      const val = (p.model_mapping[tier] || "").split(";").map(s => s.trim()).filter(s => s).join("\\n");
+      const models = (p.model_mapping[tier] || "").split(";").filter(s => s.trim());
       html += `
-        <div class="tier-card">
-          <div class="tier-name">${tier === "default" ? "DEFAULT (FALLBACK)" : tier}</div>
-          <div class="form-group">
-            <label class="form-label">MODELS (one per line)</label>
-            <textarea class="form-textarea" data-tier="${tier}" rows="3" placeholder="provider/model\\nprovider/model">${val}</textarea>
-            <div class="form-hint">e.g. openrouter/deepseek/deepseek-r1</div>
+        <div class="stat-card" style="display:flex; flex-direction:column; justify-content:space-between">
+          <div>
+            <div class="stat-label">${tier === "default" ? "DEFAULT (FALLBACK)" : tier}</div>
+            <div class="stat-value">${models.length}</div>
+            <div class="stat-sub">models configured</div>
           </div>
+          <button class="btn btn-sm btn-prov-cfg" style="margin-top:16px" data-tier="${tier}">OPEN</button>
         </div>`;
     }
+    html += '</div>';
+
     c.innerHTML = html;
-    c.querySelectorAll("textarea[data-tier]").forEach((el) => {
-      el.addEventListener("input", () => {
-        const tier = el.dataset.tier;
-        activeProfile().model_mapping[tier] = el.value.split("\\n").map(s => s.trim()).filter(s => s).join(" ; ");
+
+    c.querySelectorAll("button[data-tier]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        renderTierDetails(c, btn.dataset.tier);
+      });
+    });
+  }
+
+  function renderTierDetails(c, tier) {
+    const p = activeProfile();
+    const rawVal = p.model_mapping[tier] || "";
+    const models = rawVal.split(";").map(s => s.trim()).filter(Boolean);
+
+    let html = `<div style="margin-bottom: 16px; display:flex; justify-content:space-between; align-items:center;">
+      <button class="btn btn-sm" id="back-to-models">← BACK</button>
+      <button class="btn btn-sm btn-primary" id="cfg-tier">CONFIGURE</button>
+    </div>`;
+
+    html += `<div class="card" style="min-height: 300px; display:flex; align-items:center; justify-content:center; padding: 40px; overflow-x:auto;">
+      <div style="display:flex; align-items:center; gap:0;">
+        <!-- Left node (Tier) -->
+        <div style="padding:16px 24px; background:var(--surface-raised); border:1px solid var(--accent); border-radius:8px; text-align:center; z-index:2; min-width:140px;">
+          <div style="font-family:'Space Mono',monospace; font-size:11px; color:var(--text-secondary); margin-bottom:4px;">ROUTING TIER</div>
+          <div style="font-size:18px; font-weight:500; color:var(--text-display); text-transform:uppercase;">${tier === "default" ? "DEFAULT" : tier}</div>
+        </div>
+        
+        <!-- Center connector line -->
+        ${models.length ? `<div style="width:40px; height:2px; background:var(--border-visible);"></div>` : ''}
+        
+        <!-- Right nodes container (vertical list) -->
+        <div style="display:flex; flex-direction:column; gap:16px; position:relative;">
+    `;
+
+    if (models.length === 0) {
+      html += `<div class="empty-state-text" style="margin-left:40px">[NO MODELS CONFIGURED]</div>`;
+    } else {
+      // Draw vertical stem line for multiple items
+      if (models.length > 1) {
+        html += `<div style="position:absolute; left:0; top:50%; transform:translateY(-50%); width:2px; height:calc(100% - 64px); background:var(--border-visible);"></div>`;
+      }
+
+      for (const m of models) {
+        const parts = m.split("/");
+        const prov = parts[0] || "unknown";
+        const modelName = parts.slice(1).join("/") || "unknown";
+
+        const hasKey = p.provider_keys && p.provider_keys[prov] && p.provider_keys[prov].trim().length > 0;
+        const keyWarning = hasKey ? '' : '<span style="color:var(--warning);font-size:10px;margin-left:8px;border:1px solid var(--warning);padding:2px 4px;border-radius:4px;">NO API KEY</span>';
+
+        html += `
+          <div style="display:flex; align-items:center; position:relative; z-index:2;">
+            <div style="width:20px; height:2px; background:var(--border-visible);"></div>
+            <div style="padding:12px 16px; background:var(--surface-raised); border:1px solid var(--border); border-radius:8px; width: 280px; transition:border-color 0.2s;">
+              <div style="font-family:'Space Mono',monospace; font-size:11px; color:var(--text-secondary); margin-bottom:4px; display:flex; align-items:center; justify-content:space-between;">
+                <span>${prov.toUpperCase()}</span>
+                ${keyWarning}
+              </div>
+              <div style="font-family:'Space Mono',monospace; font-size:13px; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${modelName}">${modelName}</div>
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    html += `
+        </div>
+      </div>
+    </div>`;
+
+    c.innerHTML = html;
+
+    $("#back-to-models").addEventListener("click", () => renderModels(c));
+    $("#cfg-tier").addEventListener("click", () => {
+      const val = (p.model_mapping[tier] || "").split(";").map(s => s.trim()).filter(Boolean).join("\n");
+
+      const modalHtml = `
+        <div class="form-group">
+          <label class="form-label">MODELS (one per line)</label>
+          <textarea id="modal-tier-models" class="form-textarea" rows="6" placeholder="provider/model\\nprovider/model">${val}</textarea>
+          <div class="form-hint" style="margin-top:8px">Order determines routing priority (top to bottom).</div>
+        </div>
+        <button id="modal-tier-save" class="btn btn-primary" style="width:100%">SAVE MAPPING</button>
+      `;
+
+      openModal("Configure " + tier.toUpperCase() + " Tier", modalHtml, () => {
+        $("#modal-tier-save").addEventListener("click", async () => {
+          const newVal = $("#modal-tier-models").value.split("\n").map(s => s.trim()).filter(Boolean).join(" ; ");
+          p.model_mapping[tier] = newVal;
+          closeModal();
+          await saveConfig();
+          renderTierDetails(c, tier);
+        });
       });
     });
   }
@@ -296,69 +392,177 @@
     const p = activeProfile();
     if (!p) return;
     let html = `<div class="form-hint" style="margin-bottom:16px">Configure API key pools per provider. Multiple keys enable load-balanced rotation.</div>
-      <div class="card"><div class="card-header"><div class="card-title">PROVIDERS</div></div>
+      <div class="card">
+        <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+          <div class="card-title" style="margin-bottom:0">PROVIDERS</div>
+          <input type="text" id="prov-search" class="form-input" placeholder="Search providers..." style="width:250px; font-size:13px; padding:6px 12px">
+        </div>
         <div id="key-list"></div>
       </div>`;
     c.innerHTML = html;
     renderKeyList();
+
+    $("#prov-search").addEventListener("input", (e) => {
+      renderKeyList(e.target.value.trim().toLowerCase());
+    });
   }
 
-  function renderKeyList() {
+  function renderKeyList(searchQuery = "") {
     const el = $("#key-list");
     if (!el) return;
     const p = activeProfile();
-    
+
+    const sortedProvs = [...providers].sort((a, b) => {
+      if (a.name.toLowerCase() === "custom") return -1;
+      if (b.name.toLowerCase() === "custom") return 1;
+      return a.name.localeCompare(b.name);
+    });
+
     let html = '<div class="table-wrap"><table><tr><th>Provider</th><th>Keys Configured</th><th></th></tr>';
-    for (const pr of providers) {
+    let countMatch = 0;
+
+    for (const pr of sortedProvs) {
+      if (searchQuery && !pr.name.toLowerCase().includes(searchQuery)) continue;
+      countMatch++;
+
       const prov = pr.name;
       const rawKeys = p.provider_keys[prov] || "";
       const count = rawKeys.split(";").filter((x) => x.trim()).length;
       html += `<tr><td>${prov}</td><td>${count} key(s)</td><td style="text-align:right"><button class="btn btn-sm btn-prov-cfg" data-prov="${prov}">CONFIGURE</button></td></tr>`;
     }
+
+    if (countMatch === 0) {
+      html += `<tr><td colspan="3" style="text-align:center; color:var(--text-disabled)">[NO PROVIDERS FOUND]</td></tr>`;
+    }
+
     html += "</table></div>";
     el.innerHTML = html;
-    
+
     el.querySelectorAll(".btn-prov-cfg").forEach((btn) => {
       btn.addEventListener("click", () => {
-        openProviderConfigModal(btn.dataset.prov);
+        renderProviderDetails($("#main-content"), btn.dataset.prov);
       });
     });
   }
 
-  function openProviderConfigModal(prov) {
+  function renderProviderDetails(c, prov) {
     const p = activeProfile();
     const providerObj = providers.find(x => x.name === prov) || { default_base_url: "" };
-    
-    const existingKeys = (p.provider_keys[prov] || "").split(";").map(s => s.trim()).filter(s => s).join("\\n");
     const existingUrl = p.provider_base_urls[prov] || "";
-    
-    const html = `
-      <div class="form-group">
-        <label class="form-label">BASE URL OVERRIDE</label>
-        <input id="modal-prov-url" class="form-input" placeholder="${providerObj.default_base_url || 'https://...'}" value="${existingUrl}">
-        <div class="form-hint">Leave empty to use default</div>
+    const rawKeys = p.provider_keys[prov] || "";
+    const keysArray = rawKeys.split(";").map(s => s.trim()).filter(Boolean);
+
+    let html = `<div style="margin-bottom: 16px; display:flex; justify-content:space-between; align-items:center;">
+      <button class="btn btn-sm" id="back-to-provs">← BACK</button>
+    </div>`;
+
+    html += `
+      <div class="card"><div class="card-header"><div class="card-title">${prov.toUpperCase()} SETTINGS</div></div>
+        <div class="form-group" style="margin-bottom:0">
+          <label class="form-label">BASE URL OVERRIDE</label>
+          <div style="display:flex;gap:8px">
+            <input id="prov-url" class="form-input" placeholder="${providerObj.default_base_url || 'https://...'}" value="${existingUrl}" style="flex:1">
+            <button id="save-prov-url" class="btn btn-sm">SAVE URL</button>
+          </div>
+          <div class="form-hint" style="margin-top:8px">Leave empty to use default. Save immediately to apply.</div>
+        </div>
       </div>
-      <div class="form-group">
-        <label class="form-label">API KEYS (one per line)</label>
-        <textarea id="modal-prov-keys" class="form-textarea" rows="5" placeholder="key1\\nkey2">${existingKeys}</textarea>
-      </div>
-      <button id="modal-prov-save" class="btn btn-primary" style="width:100%">SAVE CHANGES</button>
+      
+      <div class="card"><div class="card-header"><div class="card-title">API KEYS POOL</div></div>
+        <div class="table-wrap">
+          <table>
+            <tr><th>Key</th><th>Status</th><th>Reqs</th><th>Errs</th><th></th></tr>
     `;
-    
-    openModal("Configure " + prov, html, () => {
-      $("#modal-prov-save").addEventListener("click", () => {
-        const newUrl = $("#modal-prov-url").value.trim();
-        const newKeysText = $("#modal-prov-keys").value;
-        const newKeys = newKeysText.split("\\n").map(s => s.trim()).filter(s => s).join(" ; ");
+
+    const provStatus = (status && status.key_pools && status.key_pools[prov]) || [];
+
+    if (keysArray.length === 0) {
+      html += `<tr><td colspan="5" style="text-align:center; color:var(--text-disabled)">[NO KEYS CONFIGURED]</td></tr>`;
+    } else {
+      keysArray.forEach((fullKey, idx) => {
+        // Match status using the first 8 chars preview format Crustoxy uses internally
+        const masked = fullKey.substring(0, 8) + (fullKey.length > 8 ? "..." : "");
+        const kStats = provStatus.find(s => s.key_preview === masked) || { healthy: false, on_cooldown: false, total_requests: 0, total_errors: 0, _unknown: true };
+
+        let statLabel = "UNKNOWN";
+        let statCls = "";
+        if (!kStats._unknown) {
+          statCls = kStats.on_cooldown ? "cooldown" : kStats.healthy ? "healthy" : "unhealthy";
+          statLabel = kStats.on_cooldown ? "COOLDOWN" : kStats.healthy ? "HEALTHY" : "ERROR";
+        }
+
+        let displayKey = fullKey;
+        if (fullKey.length > 20) {
+          displayKey = fullKey.substring(0, 12) + "••••••••••••" + fullKey.substring(fullKey.length - 4);
+        }
+
+        html += `
+          <tr>
+            <td style="font-family:'Space Mono',monospace;">${displayKey}</td>
+            <td><span class="status-dot ${statCls}"></span>${statLabel}</td>
+            <td>${kStats.total_requests}</td>
+            <td>${kStats.total_errors}</td>
+            <td style="text-align:right"><button class="btn btn-sm del-key-btn" data-idx="${idx}" style="color:var(--error);border-color:transparent;background:transparent">✕</button></td>
+          </tr>
+        `;
+      });
+    }
+
+    html += `
+          </table>
+        </div>
         
-        if (newUrl) p.provider_base_urls[prov] = newUrl;
-        else delete p.provider_base_urls[prov];
-        
-        if (newKeys) p.provider_keys[prov] = newKeys;
-        else delete p.provider_keys[prov];
-        
-        closeModal();
-        renderKeyList(); // Re-render the table
+        <div style="margin-top:24px; border-top:1px solid var(--border); padding-top:16px;">
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">ADD NEW KEY</label>
+            <div style="display:flex;gap:8px">
+              <input id="new-key-val" class="form-input" placeholder="sk-..." style="flex:1">
+              <button id="add-key-btn" class="btn btn-sm btn-primary">ADD KEY</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    c.innerHTML = html;
+
+    $("#back-to-provs").addEventListener("click", () => renderKeys(c));
+
+    $("#save-prov-url").addEventListener("click", () => {
+      const u = $("#prov-url").value.trim();
+      if (u) p.provider_base_urls[prov] = u;
+      else delete p.provider_base_urls[prov];
+
+      const btn = $("#save-prov-url");
+      btn.textContent = "SAVED";
+      btn.style.borderColor = "var(--success)";
+      btn.style.color = "var(--success)";
+      setTimeout(() => {
+        btn.textContent = "SAVE URL";
+        btn.style.borderColor = "";
+        btn.style.color = "";
+      }, 2000);
+    });
+
+    $("#add-key-btn").addEventListener("click", () => {
+      const nk = $("#new-key-val").value.trim();
+      if (nk) {
+        keysArray.push(nk);
+        p.provider_keys[prov] = keysArray.join(" ; ");
+        renderProviderDetails(c, prov);
+      }
+    });
+
+    c.querySelectorAll(".del-key-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const idx = parseInt(btn.dataset.idx);
+        keysArray.splice(idx, 1);
+        if (keysArray.length > 0) {
+          p.provider_keys[prov] = keysArray.join(" ; ");
+        } else {
+          delete p.provider_keys[prov];
+        }
+        renderProviderDetails(c, prov);
       });
     });
   }
@@ -390,6 +594,12 @@
     html += `<div class="card"><div class="card-header"><div class="card-title">TOOL RETRY MAX</div></div>
       <input class="form-input" type="number" id="tool-retry-max" value="${f.tool_retry_max || 2}" min="0" max="10" style="width:100px">
     </div>`;
+    html += `<div class="card"><div class="card-header"><div class="card-title">SYSTEM PROMPT OVERRIDE</div></div>
+      <div class="form-group" style="margin-bottom:0">
+        <textarea id="override-sys-prompt" class="form-textarea" rows="4" placeholder="Leave empty to use Claude's default system prompt.">${f.override_system_prompt || ""}</textarea>
+        <div class="form-hint" style="margin-top:8px">Overrides the default system prompt sent to the LLM. Applies globally to this profile.</div>
+      </div>
+    </div>`;
     c.innerHTML = html;
 
     c.querySelectorAll(".toggle").forEach((el) => {
@@ -401,6 +611,8 @@
     });
     const retryInput = $("#tool-retry-max");
     if (retryInput) retryInput.addEventListener("change", () => { f.tool_retry_max = parseInt(retryInput.value) || 2; });
+    const sysPromptInput = $("#override-sys-prompt");
+    if (sysPromptInput) sysPromptInput.addEventListener("change", () => { f.override_system_prompt = sysPromptInput.value.trim() || null; });
   }
 
   // ── Routing Page ─────────────────────────────────────────────────────────
@@ -414,7 +626,7 @@
       <div class="card"><div class="card-header"><div class="card-title">MODEL ROUTING STRATEGY</div></div>
         <select class="form-select" id="r-model-strat">${strategies.map((s) => `<option value="${s}" ${r.model_strategy === s ? "selected" : ""}>${s.replace(/_/g, " ").toUpperCase()}</option>`).join("")}</select>
       </div>
-      <div class="card"><div class="card-header"><div class="card-title">KEY ROUTING STRATEGY</div></div>
+      <div class="card"><div class="card-header"><div class="card-title">API KEYS POOL ROUTING STRATEGY</div></div>
         <select class="form-select" id="r-key-strat">${strategies.map((s) => `<option value="${s}" ${r.key_strategy === s ? "selected" : ""}>${s.replace(/_/g, " ").toUpperCase()}</option>`).join("")}</select>
       </div>
       <div class="dashboard-grid">
@@ -543,7 +755,8 @@
       $("#version").textContent = "v" + (status.version || "?");
       updateProfileSelect();
       showApp();
-      renderPage("dashboard");
+      const lastPage = localStorage.getItem('crustoxy_page') || "dashboard";
+      renderPage(lastPage);
       updateStatusIndicator();
     } catch {
       // Needs auth
@@ -564,7 +777,7 @@
     });
 
     $("#save-btn").addEventListener("click", saveConfig);
-    
+
     $("#modal-close").addEventListener("click", closeModal);
     $("#modal-overlay").addEventListener("click", (e) => {
       if (e.target.id === "modal-overlay") closeModal();
