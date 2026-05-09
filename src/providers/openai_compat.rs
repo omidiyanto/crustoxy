@@ -607,160 +607,237 @@ impl OpenAICompatProvider {
         }
     }
 
-    /// Send a non-streaming request to the provider and return an Anthropic MessagesResponse.
-    ///
-    /// **Fallback**: If `stream == Some(false)` in the request, this is used instead of SSE.
-    /// If this method fails, the error is propagated to the caller — no side effects.
     pub async fn send_non_streaming(
         &self,
         request: &MessagesRequest,
         input_tokens: u32,
         request_id: &str,
+        key_pool: Arc<KeyPoolManager>,
+        model_router: Arc<ModelRouter>,
     ) -> Result<Value, String> {
-        let resolved = request
+        let request_model = request.model.clone();
+        let mut resolved = request
             .resolved_provider_model
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
-        let provider_type = Settings::parse_provider_type(&resolved);
-        let model_name = Settings::parse_model_name(&resolved);
-        let base_url = get_provider_base_url(provider_type);
-        let api_key = get_provider_api_key(provider_type).unwrap_or_default();
-
-        let mut body = build_openai_request(request, model_name, provider_type);
-        body.stream = false;
-        body.stream_options = None;
-
-        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-
-        info!(
-            "NON_STREAM: request_id={} provider={} model={}",
-            request_id, provider_type, model_name,
-        );
-
+        let max_retries: u32 = 2;
         let _permit = self.rate_limiter.acquire_concurrency().await;
-        self.rate_limiter.acquire().await;
 
-        // std::fs::write(
-        //     "openai_payload_debug_nonstream.json",
-        //     serde_json::to_string_pretty(&body).unwrap_or_default(),
-        // )
-        // .ok();
+        // Model fallback loop
+        loop {
+            let provider_type = Settings::parse_provider_type(&resolved).to_string();
+            let model_name = Settings::parse_model_name(&resolved).to_string();
+            let base_url = get_provider_base_url(&provider_type);
 
-        let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Connection error: {}", e))?;
+            let mut body = build_openai_request(request, &model_name, &provider_type);
+            body.stream = false;
+            body.stream_options = None;
 
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let body_text = response.text().await.unwrap_or_default();
-            let msg = extract_provider_error(&body_text);
-            return Err(format!("Provider returned status {}: {}", status, msg));
-        }
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-        let resp_body: Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            info!(
+                "NON_STREAM: request_id={} provider={} model={}",
+                request_id, provider_type, model_name,
+            );
 
-        // Convert OpenAI ChatCompletion → Anthropic MessagesResponse
-        let message_id = format!("msg_{}", Uuid::new_v4());
-        let choice = resp_body
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .ok_or("No choices in response")?;
+            let mut last_error = String::new();
+            let mut retries_exhausted = false;
 
-        let message = choice.get("message").ok_or("No message in choice")?;
-        let finish = choice
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stop");
+            // HTTP retry loop
+            for attempt in 0..=max_retries {
+                self.rate_limiter.acquire().await;
 
-        let mut content_blocks: Vec<Value> = Vec::new();
+                let key_ep = key_pool.acquire(&provider_type).await;
+                let api_key = key_ep
+                    .as_ref()
+                    .map(|ep| ep.key.clone())
+                    .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
 
-        // Text content
-        if let Some(text) = message.get("content").and_then(|v| v.as_str())
-            && !text.is_empty()
-        {
-            content_blocks.push(json!({"type": "text", "text": text}));
-        }
+                let resp = self
+                    .client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .json(&body)
+                    .send()
+                    .await;
 
-        // Reasoning content
-        let reasoning_val = message
-            .get("reasoning_content")
-            .or_else(|| message.get("reasoning"));
-        if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
-            && !reasoning.is_empty()
-        {
-            content_blocks.push(json!({"type": "thinking", "thinking": reasoning}));
-        }
-
-        // Tool calls
-        if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
-            for tc in tool_calls {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let args_str = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("{}");
-                let input: Value = match serde_json::from_str(args_str) {
-                    Ok(val) => val,
-                    Err(_) => {
-                        let garbled =
-                            format!(r#"{{"name": "{}", "arguments": {}}}"#, name, args_str);
-                        crate::heuristic_tool_parser::recover_garbled_tool_json(&garbled)
-                            .map(|rec| serde_json::Value::Object(rec.arguments))
-                            .unwrap_or_else(|| json!({}))
+                match resp {
+                    Err(e) => {
+                        if let Some(ep) = &key_ep {
+                            key_pool.report_error(ep, false).await;
+                        }
+                        last_error = format!("Connection error: {}", e);
+                        if attempt < max_retries {
+                            let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
+                            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                            continue;
+                        }
+                        retries_exhausted = true;
                     }
-                };
-                content_blocks.push(json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input
-                }));
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+
+                        if status == 429 {
+                            if let Some(ep) = &key_ep {
+                                key_pool.report_error(ep, true).await;
+                            }
+                            last_error = "Rate limit exceeded".to_string();
+                            if attempt < max_retries {
+                                let delay = (2u64.pow(attempt) * 2) as f64 + rand_jitter();
+                                self.rate_limiter.set_blocked(delay).await;
+                                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                continue;
+                            }
+                            retries_exhausted = true;
+                            break;
+                        }
+
+                        if status >= 400 {
+                            if let Some(ep) = &key_ep {
+                                key_pool.report_error(ep, false).await;
+                            }
+                            let body_text = response.text().await.unwrap_or_default();
+                            let msg = extract_provider_error(&body_text);
+                            last_error = format!("Provider returned status {}: {}", status, msg);
+                            if status >= 500 && attempt < max_retries {
+                                let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
+                                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                continue;
+                            }
+                            retries_exhausted = true;
+                            break;
+                        }
+
+                        // ── Success: parse response ──
+                        model_router.report_success_by_spec(&resolved).await;
+                        if let Some(ep) = &key_ep {
+                            key_pool.report_success(ep, 0).await;
+                        }
+
+                        let resp_body: Value = response
+                            .json()
+                            .await
+                            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+                        // Convert OpenAI ChatCompletion → Anthropic MessagesResponse
+                        let message_id = format!("msg_{}", Uuid::new_v4());
+                        let choice = resp_body
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .ok_or("No choices in response")?;
+
+                        let message = choice.get("message").ok_or("No message in choice")?;
+                        let finish = choice
+                            .get("finish_reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("stop");
+
+                        let mut content_blocks: Vec<Value> = Vec::new();
+
+                        // Text content
+                        if let Some(text) = message.get("content").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            content_blocks.push(json!({"type": "text", "text": text}));
+                        }
+
+                        // Reasoning content
+                        let reasoning_val = message
+                            .get("reasoning_content")
+                            .or_else(|| message.get("reasoning"));
+                        if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
+                            && !reasoning.is_empty()
+                        {
+                            content_blocks.push(json!({"type": "thinking", "thinking": reasoning}));
+                        }
+
+                        // Tool calls
+                        if let Some(tool_calls) =
+                            message.get("tool_calls").and_then(|v| v.as_array())
+                        {
+                            for tc in tool_calls {
+                                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let name = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let args_str = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("{}");
+                                let input: Value = match serde_json::from_str(args_str) {
+                                    Ok(val) => val,
+                                    Err(_) => {
+                                        let garbled = format!(
+                                            r#"{{"name": "{}", "arguments": {}}}"#,
+                                            name, args_str
+                                        );
+                                        crate::heuristic_tool_parser::recover_garbled_tool_json(
+                                            &garbled,
+                                        )
+                                        .map(|rec| serde_json::Value::Object(rec.arguments))
+                                        .unwrap_or_else(|| json!({}))
+                                    }
+                                };
+                                content_blocks.push(json!({
+                                    "type": "tool_use",
+                                    "id": id,
+                                    "name": name,
+                                    "input": input
+                                }));
+                            }
+                        }
+
+                        if content_blocks.is_empty() {
+                            content_blocks.push(json!({"type": "text", "text": " "}));
+                        }
+
+                        let usage = resp_body.get("usage");
+                        let output_tokens = usage
+                            .and_then(|u| u.get("completion_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1) as u32;
+
+                        let stop_reason = map_stop_reason(Some(finish));
+
+                        return Ok(json!({
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "model": request.model,
+                            "content": content_blocks,
+                            "stop_reason": stop_reason,
+                            "stop_sequence": null,
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                                "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": 0
+                            }
+                        }));
+                    }
+                }
             }
-        }
 
-        if content_blocks.is_empty() {
-            content_blocks.push(json!({"type": "text", "text": " "}));
-        }
-
-        let usage = resp_body.get("usage");
-        let output_tokens = usage
-            .and_then(|u| u.get("completion_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
-
-        let stop_reason = map_stop_reason(Some(finish));
-
-        Ok(json!({
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
-            "model": request.model,
-            "content": content_blocks,
-            "stop_reason": stop_reason,
-            "stop_sequence": null,
-            "usage": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0
+            // Retries exhausted — try model fallback
+            if retries_exhausted {
+                model_router.report_error_by_spec(&resolved).await;
+                if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved).await {
+                    warn!(
+                        "Non-streaming fallback from {} to {}",
+                        resolved, next_ep.full_spec
+                    );
+                    resolved = next_ep.full_spec.clone();
+                    continue;
+                }
             }
-        }))
+
+            return Err(last_error);
+        }
     }
 }
 
@@ -807,5 +884,10 @@ fn rand_jitter() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    (nanos % 1000) as f64 / 1000.0
+    // Mix in thread identity for decorrelation across concurrent calls
+    let tid = format!("{:?}", std::thread::current().id());
+    let tid_hash: u32 = tid
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    (nanos.wrapping_add(tid_hash) % 1000) as f64 / 1000.0
 }

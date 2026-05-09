@@ -317,6 +317,8 @@ impl SSEBuilder {
     }
 
     pub fn has_any_content(&self) -> bool {
-        self.blocks.text_index >= 0 || !self.blocks.tool_states.is_empty()
+        self.blocks.text_index >= 0
+            || self.blocks.thinking_index >= 0
+            || !self.blocks.tool_states.is_empty()
     }
 }

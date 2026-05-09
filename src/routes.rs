@@ -261,7 +261,13 @@ pub async fn create_message(
     if request.stream == Some(false) {
         let result = state
             .provider
-            .send_non_streaming(&request, input_tokens, &request_id)
+            .send_non_streaming(
+                &request,
+                input_tokens,
+                &request_id,
+                state.key_pool_manager.clone(),
+                state.model_router.clone(),
+            )
             .await;
         return match result {
             Ok(response_json) => Json(response_json).into_response(),
