@@ -203,7 +203,7 @@ pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
 ///
 /// Anthropic sends: `{"type": "auto"}`, `{"type": "any"}`, `{"type": "tool", "name": "X"}`
 /// OpenAI expects: `"auto"`, `"required"`, `{"type": "function", "function": {"name": "X"}}`
-pub fn convert_tool_choice(tool_choice: &Option<Value>) -> Option<Value> {
+pub fn convert_tool_choice(tool_choice: &Option<Value>, strict_mode: bool) -> Option<Value> {
     match tool_choice {
         None => None,
         Some(val) => {
@@ -217,14 +217,18 @@ pub fn convert_tool_choice(tool_choice: &Option<Value>) -> Option<Value> {
                     Some("auto") => Some(serde_json::json!("auto")),
                     Some("any") => Some(serde_json::json!("required")),
                     Some("tool") => {
-                        let name = obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        Some(serde_json::json!({
-                            "type": "function",
-                            "function": {"name": name}
-                        }))
+                        if strict_mode {
+                            Some(serde_json::json!("auto"))
+                        } else {
+                            let name = obj
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            Some(serde_json::json!({
+                                "type": "function",
+                                "function": {"name": name}
+                            }))
+                        }
                     }
                     _ => Some(val.clone()),
                 }
@@ -235,7 +239,11 @@ pub fn convert_tool_choice(tool_choice: &Option<Value>) -> Option<Value> {
     }
 }
 
-pub fn build_openai_request(request: &MessagesRequest, model_name: &str) -> ChatCompletionRequest {
+pub fn build_openai_request(
+    request: &MessagesRequest,
+    model_name: &str,
+    provider_type: &str,
+) -> ChatCompletionRequest {
     let mut messages = Vec::new();
     if let Some(sys) = convert_system_prompt(&request.system) {
         messages.push(sys);
@@ -243,7 +251,10 @@ pub fn build_openai_request(request: &MessagesRequest, model_name: &str) -> Chat
     messages.extend(convert_messages(&request.messages));
 
     let tools = request.tools.as_ref().map(|t| convert_tools(t));
-    let tool_choice = convert_tool_choice(&request.tool_choice);
+    let strict_tool_choice = provider_type == "kimi_oauth"
+        || provider_type == "nvidia_nim"
+        || provider_type == "moonshot";
+    let tool_choice = convert_tool_choice(&request.tool_choice, strict_tool_choice);
 
     ChatCompletionRequest {
         model: model_name.to_string(),

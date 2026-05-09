@@ -126,7 +126,7 @@ impl PuterProvider {
 
     /// Build the `args` object for Puter's chat driver — full OpenAI-style request
     /// (preserves messages with tool_calls/tool_call_id, tools, tool_choice).
-    fn build_args(request: &MessagesRequest, stream: bool) -> Value {
+    fn build_args(request: &MessagesRequest, stream: bool, provider_type: &str) -> Value {
         let model_name = Settings::parse_model_name(
             request
                 .resolved_provider_model
@@ -135,7 +135,7 @@ impl PuterProvider {
         )
         .to_string();
 
-        let openai_req = build_openai_request(request, &model_name);
+        let openai_req = build_openai_request(request, &model_name, provider_type);
         let mut args = serde_json::to_value(&openai_req).unwrap_or_else(|_| json!({}));
         if let Some(obj) = args.as_object_mut() {
             obj.insert("stream".to_string(), json!(stream));
@@ -152,7 +152,13 @@ impl PuterProvider {
         request_id: &str,
     ) -> impl Stream<Item = String> + use<> {
         let request_model = request.model.clone();
-        let initial_args = Self::build_args(request, true);
+        let resolved = request
+            .resolved_provider_model
+            .clone()
+            .unwrap_or_else(|| request.model.clone());
+        let provider_type = Settings::parse_provider_type(&resolved).to_string();
+
+        let initial_args = Self::build_args(request, true, &provider_type);
 
         let model_for_log = initial_args
             .get("model")
@@ -740,7 +746,13 @@ impl PuterProvider {
         input_tokens: u32,
         request_id: &str,
     ) -> Result<Value, String> {
-        let args = Self::build_args(request, false);
+        let resolved = request
+            .resolved_provider_model
+            .clone()
+            .unwrap_or_else(|| request.model.clone());
+        let provider_type = Settings::parse_provider_type(&resolved).to_string();
+
+        let args = Self::build_args(request, false, &provider_type);
         let model_for_log = args
             .get("model")
             .and_then(|v| v.as_str())

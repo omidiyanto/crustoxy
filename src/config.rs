@@ -124,6 +124,16 @@ pub const PROVIDERS: &[ProviderDef] = &[
         default_base_url: "http://localhost:8080/v1",
     },
     ProviderDef {
+        name: "kimi_oauth",
+        env_prefix: "KIMI_OAUTH",
+        default_base_url: "https://api.kimi.com/coding/v1",
+    },
+    ProviderDef {
+        name: "sumopod",
+        env_prefix: "SUMOPOD",
+        default_base_url: "https://ai.sumopod.com/v1",
+    },
+    ProviderDef {
         name: "custom",
         env_prefix: "CUSTOM",
         default_base_url: "",
@@ -165,6 +175,7 @@ pub struct Settings {
     pub override_system_prompt: Option<String>,
     // Puter provider (auto-enabled when puter_api_key is set)
     pub puter_api_key: Option<String>,
+    pub kimi_oauth_enable: bool,
 }
 
 impl Settings {
@@ -203,6 +214,9 @@ impl Settings {
             enable_rtk: env_or("ENABLE_RTK", "true").parse().unwrap_or(true),
             override_system_prompt: env_or_none("OVERRIDE_SYSTEM_PROMPT"),
             puter_api_key: env_or_none("PUTER_API_KEY"),
+            kimi_oauth_enable: env_or("KIMI_OAUTH_ENABLE", "false")
+                .parse()
+                .unwrap_or(false),
         }
     }
 

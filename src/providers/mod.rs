@@ -1,3 +1,4 @@
+pub mod kimi_oauth;
 pub mod openai_compat;
 pub mod puter;
 

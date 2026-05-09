@@ -69,7 +69,7 @@ impl OpenAICompatProvider {
         let request_model = request.model.clone();
 
         let message_id = format!("msg_{}", Uuid::new_v4());
-        let body = build_openai_request(request, &model_name);
+        let body = build_openai_request(request, &model_name, &provider_type);
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
         let request_id = request_id.to_string();
@@ -560,7 +560,7 @@ impl OpenAICompatProvider {
         let base_url = get_provider_base_url(provider_type);
         let api_key = get_provider_api_key(provider_type).unwrap_or_default();
 
-        let mut body = build_openai_request(request, model_name);
+        let mut body = build_openai_request(request, model_name, provider_type);
         body.stream = false;
         body.stream_options = None;
 

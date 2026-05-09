@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OutputConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagesRequest {
     pub model: String,
@@ -27,6 +33,8 @@ pub struct MessagesRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub thinking: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
     #[serde(default)]
     pub extra_body: Option<Value>,
 

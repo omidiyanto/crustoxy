@@ -24,6 +24,8 @@ pub struct AppState {
     pub settings: Settings,
     pub provider: OpenAICompatProvider,
     pub puter_provider: Option<std::sync::Arc<PuterProvider>>,
+    pub kimi_oauth_provider:
+        Option<std::sync::Arc<crate::providers::kimi_oauth::KimiOauthProvider>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -152,6 +154,50 @@ pub async fn create_message(
             )
                 .into_response();
         }
+    } else if provider_type == "kimi_oauth" {
+        if let Some(ref kimi_provider) = state.kimi_oauth_provider {
+            if request.stream == Some(false) {
+                let result = kimi_provider
+                    .send_non_streaming(&request, input_tokens, &request_id)
+                    .await;
+                return match result {
+                    Ok(response_json) => Json(response_json).into_response(),
+                    Err(e) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": e}
+                        })),
+                    )
+                        .into_response(),
+                };
+            }
+
+            let stream = kimi_provider.stream_response(&request, input_tokens, &request_id);
+            let body_stream =
+                tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
+
+            return Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .header("X-Accel-Buffering", "no")
+                .body(Body::from_stream(body_stream))
+                .unwrap();
+        } else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Kimi OAuth provider not enabled. Set KIMI_OAUTH_ENABLE=true."
+                    }
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Non-streaming path (fallback — only when client explicitly sets stream: false)
@@ -213,6 +259,7 @@ pub async fn count_tokens(
         tools: request.tools,
         tool_choice: None,
         thinking: None,
+        output_config: None,
         extra_body: None,
         original_model: None,
         resolved_provider_model: None,
@@ -231,6 +278,12 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         "disabled"
     };
 
+    let kimi_status = if state.kimi_oauth_provider.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+
     Json(json!({
         "status": "healthy",
         "model": state.settings.model,
@@ -241,6 +294,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             "tool_retry": state.settings.enable_tool_retry,
             "rtk": state.settings.enable_rtk,
             "puter": puter_status,
+            "kimi_oauth": kimi_status,
         }
     }))
 }
