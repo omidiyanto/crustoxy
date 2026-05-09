@@ -26,6 +26,7 @@ pub struct AppState {
     pub puter_provider: Option<std::sync::Arc<PuterProvider>>,
     pub kimi_oauth_provider:
         Option<std::sync::Arc<crate::providers::kimi_oauth::KimiOauthProvider>>,
+    pub cloudflare_provider: Option<std::sync::Arc<crate::providers::CloudflareProvider>>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -198,6 +199,50 @@ pub async fn create_message(
             )
                 .into_response();
         }
+    } else if provider_type == "cloudflare" {
+        if let Some(ref cloudflare_provider) = state.cloudflare_provider {
+            if request.stream == Some(false) {
+                let result = cloudflare_provider
+                    .send_non_streaming(&request, input_tokens, &request_id)
+                    .await;
+                return match result {
+                    Ok(response_json) => Json(response_json).into_response(),
+                    Err(e) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": e}
+                        })),
+                    )
+                        .into_response(),
+                };
+            }
+
+            let stream = cloudflare_provider.stream_response(&request, input_tokens, &request_id);
+            let body_stream =
+                tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
+
+            return Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .header("X-Accel-Buffering", "no")
+                .body(Body::from_stream(body_stream))
+                .unwrap();
+        } else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "Cloudflare provider not enabled. Set CLOUDFLARE_API_KEY to enable."
+                    }
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Non-streaming path (fallback — only when client explicitly sets stream: false)
@@ -284,6 +329,12 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         "disabled"
     };
 
+    let cloudflare_status = if state.cloudflare_provider.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+
     Json(json!({
         "status": "healthy",
         "model": state.settings.model,
@@ -295,6 +346,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             "rtk": state.settings.enable_rtk,
             "puter": puter_status,
             "kimi_oauth": kimi_status,
+            "cloudflare": cloudflare_status,
         }
     }))
 }
