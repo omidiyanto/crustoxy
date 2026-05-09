@@ -159,11 +159,18 @@ impl KeyPool {
     }
 
     async fn is_available(&self, ep: &KeyEndpoint) -> bool {
-        if !ep.healthy.load(Ordering::Relaxed) {
-            return false;
+        if ep.healthy.load(Ordering::Relaxed) {
+            return true;
         }
-        let lock = ep.cooldown_until.lock().await;
-        !matches!(*lock, Some(until) if Instant::now() < until)
+        // Check if cooldown has expired
+        let mut lock = ep.cooldown_until.lock().await;
+        if lock.is_some_and(|until| Instant::now() >= until) {
+            *lock = None;
+            ep.healthy.store(true, Ordering::Relaxed);
+            ep.consecutive_errors.store(0, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     /// Report a successful request — resets error counter.
@@ -190,6 +197,7 @@ impl KeyPool {
             let until = Instant::now() + std::time::Duration::from_secs(cooldown);
             let mut lock = endpoint.cooldown_until.lock().await;
             *lock = Some(until);
+            endpoint.healthy.store(false, Ordering::Relaxed);
 
             let preview = mask_key(&endpoint.key);
             warn!(

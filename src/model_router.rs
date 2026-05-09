@@ -303,19 +303,18 @@ impl ModelRouter {
     }
 
     async fn is_available(&self, ep: &ModelEndpoint) -> bool {
-        if !ep.healthy.load(Ordering::Relaxed) {
-            // Check if cooldown has expired
-            let mut lock = ep.cooldown_until.lock().await;
-            if lock.is_some_and(|until| Instant::now() >= until) {
-                *lock = None;
-                ep.healthy.store(true, Ordering::Relaxed);
-                ep.consecutive_errors.store(0, Ordering::Relaxed);
-                return true;
-            }
-            return false;
+        if ep.healthy.load(Ordering::Relaxed) {
+            return true;
         }
-        let lock = ep.cooldown_until.lock().await;
-        !matches!(*lock, Some(until) if Instant::now() < until)
+        // Check if cooldown has expired
+        let mut lock = ep.cooldown_until.lock().await;
+        if lock.is_some_and(|until| Instant::now() >= until) {
+            *lock = None;
+            ep.healthy.store(true, Ordering::Relaxed);
+            ep.consecutive_errors.store(0, Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 }
 
