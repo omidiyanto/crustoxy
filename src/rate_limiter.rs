@@ -66,8 +66,16 @@ impl RateLimiter {
 
     pub async fn set_blocked(&self, seconds: f64) {
         let mut blocked = self.blocked_until.lock().await;
-        *blocked = Some(Instant::now() + std::time::Duration::from_secs_f64(seconds));
-        warn!("Rate limit block set for {:.1}s", seconds);
+        let new_until = Instant::now() + std::time::Duration::from_secs_f64(seconds);
+        match *blocked {
+            Some(existing) if existing >= new_until => {
+                // Already blocked for longer, do nothing
+            }
+            _ => {
+                *blocked = Some(new_until);
+                warn!("Rate limit block set/extended for {:.1}s", seconds);
+            }
+        }
     }
 
     pub async fn clear_block(&self) {
