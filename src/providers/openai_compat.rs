@@ -156,6 +156,7 @@ impl OpenAICompatProvider {
                             }
 
                             // Fallback on network error
+                            model_router.report_error_by_spec(&resolved_spec).await;
                             if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
                                 warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
                                 resolved_spec = next_ep.full_spec.clone();
@@ -196,6 +197,7 @@ impl OpenAICompatProvider {
 
                                 last_error = Some("Rate limit exceeded. Retries exhausted.".to_string());
                                 // Try model fallback on 429 after retries
+                                model_router.report_error_by_spec(&resolved_spec).await;
                                 if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
                                     warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
                                     resolved_spec = next_ep.full_spec.clone();
@@ -234,18 +236,20 @@ impl OpenAICompatProvider {
                                 }
 
                                 // Model fallback on hard errors
-                                if attempt == max_retries
-                                    && let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await
-                                {
-                                    warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
-                                    resolved_spec = next_ep.full_spec.clone();
-                                    current_body.model = next_ep.model_name.clone();
-                                    continue 'tool_retry;
+                                if attempt == max_retries {
+                                    model_router.report_error_by_spec(&resolved_spec).await;
+                                    if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
+                                        warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
+                                        resolved_spec = next_ep.full_spec.clone();
+                                        current_body.model = next_ep.model_name.clone();
+                                        continue 'tool_retry;
+                                    }
                                 }
                                 break;
                             }
 
                             // ── Successful response: process stream ──────────
+                            model_router.report_success_by_spec(&resolved_spec).await;
                             if let Some(ep) = &key_ep {
                                 key_pool.report_success(ep, 0).await; // Can pass real latency here later
                             }

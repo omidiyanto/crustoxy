@@ -6,10 +6,22 @@ use tracing::{error, info, warn};
 use std::sync::OnceLock;
 
 static IP_ROTATION_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+static LAST_ROTATION: OnceLock<Arc<Mutex<std::time::Instant>>> = OnceLock::new();
 
 fn get_lock() -> Arc<Mutex<()>> {
     IP_ROTATION_LOCK
         .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn get_last_rotation() -> Arc<Mutex<std::time::Instant>> {
+    LAST_ROTATION
+        .get_or_init(|| {
+            // Initialize with a time in the past
+            Arc::new(Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(3600),
+            ))
+        })
         .clone()
 }
 
@@ -32,6 +44,18 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
 pub async fn rotate_ip() -> Result<(), String> {
     let lock = get_lock();
     let _guard = lock.lock().await;
+
+    // Check if we already rotated recently (within 20 seconds)
+    {
+        let rot_arc = get_last_rotation();
+        let mut last_rot = rot_arc.lock().await;
+        if last_rot.elapsed() < std::time::Duration::from_secs(20) {
+            info!("IP rotation skipped (already rotated recently).");
+            return Ok(());
+        }
+        // Update the timestamp so subsequent waiters skip it too
+        *last_rot = std::time::Instant::now();
+    }
 
     info!("Starting IP rotation via WARP...");
 
@@ -75,6 +99,11 @@ pub async fn rotate_ip() -> Result<(), String> {
     }
 
     info!("IP rotation completed");
+    // Update timestamp again upon completion
+    {
+        let rot_arc = get_last_rotation();
+        *rot_arc.lock().await = std::time::Instant::now();
+    }
     Ok(())
 }
 

@@ -124,6 +124,19 @@ impl ModelRouter {
         endpoint.healthy.store(true, Ordering::Relaxed);
     }
 
+    /// Report success by full spec.
+    pub async fn report_success_by_spec(&self, full_spec: &str) {
+        let tiers = self.tiers.read().await;
+        for endpoints in tiers.values() {
+            for ep in endpoints {
+                if ep.full_spec == full_spec {
+                    self.report_success(ep).await;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Report an error — may trigger cooldown.
     #[allow(dead_code)]
     pub async fn report_error(&self, endpoint: &ModelEndpoint) {
@@ -140,6 +153,19 @@ impl ModelRouter {
                 "Model {} placed on {}s cooldown after {} errors",
                 endpoint.full_spec, cooldown_secs, errors
             );
+        }
+    }
+
+    /// Report an error by full spec.
+    pub async fn report_error_by_spec(&self, full_spec: &str) {
+        let tiers = self.tiers.read().await;
+        for endpoints in tiers.values() {
+            for ep in endpoints {
+                if ep.full_spec == full_spec {
+                    self.report_error(ep).await;
+                    return;
+                }
+            }
         }
     }
 
