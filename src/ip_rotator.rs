@@ -77,3 +77,19 @@ pub async fn rotate_ip() -> Result<(), String> {
     info!("IP rotation completed");
     Ok(())
 }
+
+/// Sync WARP connection state based on the provided flag.
+pub async fn sync_warp_state(enabled: bool) {
+    let lock = get_lock();
+    let _guard = lock.lock().await;
+
+    if enabled {
+        info!("Enabling WARP connection...");
+        let _ = run_cmd("warp-cli", &["--accept-tos", "registration", "new"]).await;
+        let _ = run_cmd("warp-cli", &["--accept-tos", "connect"]).await;
+    } else {
+        info!("Disabling WARP connection...");
+        let _ = run_cmd("warp-cli", &["--accept-tos", "disconnect"]).await;
+        let _ = run_cmd("warp-cli", &["--accept-tos", "registration", "delete"]).await;
+    }
+}

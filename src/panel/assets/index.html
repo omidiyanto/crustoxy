@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crustoxy Panel</title>
+  <meta name="description" content="Crustoxy Proxy Configuration Dashboard">
+  <link rel="stylesheet" href="/ui/styles.css">
+  <style>
+    /* Critical inline — prevent FOUC */
+    body { background: #000; color: #e8e8e8; }
+    .app { display: none; }
+    .auth-screen { display: none; }
+    .loading-screen {
+      display: flex; align-items: center; justify-content: center;
+      height: 100vh; font-family: 'Space Mono', monospace;
+      font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+  <!-- Loading state -->
+  <div id="loading" class="loading-screen">[LOADING...]</div>
+
+  <!-- Auth screen (shown when token is required) -->
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-box">
+      <div class="auth-title">Crustoxy Panel</div>
+      <input id="auth-input" class="auth-input" type="password"
+             placeholder="Enter auth token" autocomplete="off">
+      <div id="auth-error" class="auth-error"></div>
+      <button id="auth-btn" class="btn btn-primary btn-pill" style="width:100%">
+        Authenticate
+      </button>
+    </div>
+  </div>
+
+  <!-- Main app -->
+  <div id="app" class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-brand">
+          <span style="color:#d71921;font-size:18px">⬡</span>
+          <h1>Crustoxy</h1>
+        </div>
+        <div class="sidebar-version" id="version">v0.0.0</div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="nav-section-label">Overview</div>
+        <div class="nav-item active" data-page="dashboard">
+          <span class="nav-icon">◉</span>
+          <span>Dashboard</span>
+        </div>
+
+        <div class="nav-section-label">Configuration</div>
+        <div class="nav-item" data-page="models">
+          <span class="nav-icon">⊞</span>
+          <span>Models</span>
+        </div>
+        <div class="nav-item" data-page="keys">
+          <span class="nav-icon">⚿</span>
+          <span>Providers</span>
+        </div>
+        <div class="nav-item" data-page="features">
+          <span class="nav-icon">⚙</span>
+          <span>Features</span>
+        </div>
+        <div class="nav-item" data-page="routing">
+          <span class="nav-icon">⇄</span>
+          <span>Routing</span>
+        </div>
+        <div class="nav-item" data-page="profiles">
+          <span class="nav-icon">⊡</span>
+          <span>Profiles</span>
+        </div>
+        <div class="nav-item" data-page="settings">
+          <span class="nav-icon">≡</span>
+          <span>Settings</span>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="status-badge">
+          <span class="status-dot healthy pulse" id="status-dot"></span>
+          <span class="status-text running" id="status-label">RUNNING</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main content -->
+    <main class="main">
+      <header class="main-header">
+        <h2 id="page-title">Dashboard</h2>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="profile-select" class="profile-select"></select>
+          <button id="save-btn" class="btn btn-success btn-sm">SAVE & APPLY</button>
+          <span id="save-status" class="inline-status"></span>
+        </div>
+      </header>
+
+      <div class="main-content" id="main-content">
+        <!-- Content injected by app.js -->
+      </div>
+    </main>
+  </div>
+
+  <!-- Modal Container -->
+  <div id="modal-overlay" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="modal-title" class="modal-title">Configure</h3>
+        <span id="modal-close" class="modal-close">✕</span>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

@@ -1,6 +1,6 @@
 [package]
 name = "crustoxy"
-version = "2.1.2"
+version = "2.2.0"
 edition = "2024"
 
 [dependencies]
@@ -21,6 +21,12 @@ rand = "0.8"
 dirs = "5"
 base64 = "0.22"
 hostname = "0.4"
+toml = "0.8"
+notify = { version = "7", features = ["macos_kqueue"] }
+rust-embed = "8"
+arc-swap = "1"
+tokio-util = "0.7"
+mime_guess = "2"
 
 [profile.release]
 opt-level = 3
