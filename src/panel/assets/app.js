@@ -528,10 +528,11 @@
 
     $("#back-to-provs").addEventListener("click", () => renderKeys(c));
 
-    $("#save-prov-url").addEventListener("click", () => {
+    $("#save-prov-url").addEventListener("click", async () => {
       const u = $("#prov-url").value.trim();
       if (u) p.provider_base_urls[prov] = u;
       else delete p.provider_base_urls[prov];
+      await saveConfig();
 
       const btn = $("#save-prov-url");
       btn.textContent = "SAVED";
@@ -544,17 +545,18 @@
       }, 2000);
     });
 
-    $("#add-key-btn").addEventListener("click", () => {
+    $("#add-key-btn").addEventListener("click", async () => {
       const nk = $("#new-key-val").value.trim();
       if (nk) {
         keysArray.push(nk);
         p.provider_keys[prov] = keysArray.join(" ; ");
+        await saveConfig();
         renderProviderDetails(c, prov);
       }
     });
 
     c.querySelectorAll(".del-key-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", async () => {
         const idx = parseInt(btn.dataset.idx);
         keysArray.splice(idx, 1);
         if (keysArray.length > 0) {
@@ -562,6 +564,7 @@
         } else {
           delete p.provider_keys[prov];
         }
+        await saveConfig();
         renderProviderDetails(c, prov);
       });
     });
