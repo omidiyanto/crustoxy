@@ -144,7 +144,8 @@ The project includes a `docker-compose.yaml` to spin up the Rust binary on an ul
 # 2. Start the service
 docker-compose up -d --build
 
-# View logs
+# Note: For Kimi OAuth interactive login, attach to the container:
+# docker attach crustoxy
 docker-compose logs -f
 ```
 
@@ -223,8 +224,9 @@ Crustoxy employs algorithmic Sliding Window limits to prevent your account from 
 - `ENABLE_RTK` *(default: `true`)*: When enabled, Claude Code's massive default system prompt (4,000–8,000 tokens) is automatically compacted into a concise RTK-style factual summary (200–300 tokens). Essential metadata (workspace path, OS platform, OS version) is preserved; repetitive instructional boilerplate is stripped.
 - `OVERRIDE_SYSTEM_PROMPT`: Leave blank to use RTK-compacted prompt. Set to any text string to fully replace the system prompt sent to the provider, bypassing both the original and the RTK-compacted version.
 
-### 7. Puter Provider
+### 7. Puter Provider & Kimi OAuth
 - `PUTER_API_KEY`: Puter.com credentials in `username:password` format. On startup, Crustoxy logs in and obtains a session token which is cached in memory for ~23 hours. Re-authentication happens automatically on token expiry or process restart.
+- `KIMI_OAUTH_ENABLE` *(default: `false`)*: Activates the native Device-Code OAuth flow for Moonshot Kimi. When `true`, proxy will halt on startup to present a browser login link, capturing the `kimi:coding_api` access token locally to disk (`~/.config/crustoxy/kimi_oauth/auth.json`).
 
 ### 8. Optimizations & Safety Nets
 - `ENABLE_NETWORK_PROBE_MOCK` / `ENABLE_TITLE_GENERATION_SKIP` / `ENABLE_SUGGESTION_MODE_SKIP` / `ENABLE_FILEPATH_EXTRACTION_MOCK`: Set to `true` to intercept internal telemetry and UI-aesthetic requests heavily spammed by Claude Code. Crustoxy mocks perfect responses instantly, slashing your API token costs heavily.
@@ -252,6 +254,8 @@ No need to figure out endpoint definitions. Just pop in your `API_KEY` for any o
 | **Fireworks AI** | `FIREWORKS_API_KEY` | `https://api.fireworks.ai/inference/v1` |
 | **DeepInfra** | `DEEPINFRA_API_KEY` | `https://api.deepinfra.com/v1/openai` |
 | **Ollama** | `OLLAMA_API_KEY` | `http://localhost:11434/v1` |
+| **Kimi OAuth** | `KIMI_OAUTH_ENABLE` | `https://api.kimi.com/coding/v1` |
+| **SumoPod** | `SUMOPOD_API_KEY` | `https://ai.sumopod.com/v1` |
 | *...and 10+ more local/cloud services!* | | |
 
 *If you need to use a custom provider, just prefix it with `CUSTOM` inside `.env`.*

@@ -65,10 +65,29 @@ async fn main() {
         None
     };
 
+    let kimi_oauth_provider = if settings.kimi_oauth_enable {
+        info!("KIMI_OAUTH_ENABLE detected, checking provider initialization...");
+        match providers::kimi_oauth::bootstrap_if_enabled(&settings).await {
+            Ok(Some(provider)) => {
+                info!("Kimi OAuth provider ready");
+                Some(provider)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("Failed to initialize Kimi OAuth provider: {}", e);
+                info!("Continuing without Kimi OAuth provider");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         settings: settings.clone(),
         provider,
         puter_provider,
+        kimi_oauth_provider,
     });
 
     let app = Router::new()

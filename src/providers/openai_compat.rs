@@ -69,7 +69,7 @@ impl OpenAICompatProvider {
         let request_model = request.model.clone();
 
         let message_id = format!("msg_{}", Uuid::new_v4());
-        let body = build_openai_request(request, &model_name);
+        let body = build_openai_request(request, &model_name, &provider_type);
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
         let request_id = request_id.to_string();
@@ -87,6 +87,12 @@ impl OpenAICompatProvider {
             body.messages.len(),
             body.tools.as_ref().map_or(0, |t| t.len()),
         );
+
+        // std::fs::write(
+        //     "openai_payload_debug.json",
+        //     serde_json::to_string_pretty(&body).unwrap_or_default(),
+        // )
+        // .ok();
 
         async_stream::stream! {
             let mut sse = SSEBuilder::new(message_id, request_model, input_tokens);
@@ -115,14 +121,16 @@ impl OpenAICompatProvider {
                 for attempt in 0..=max_retries {
                     rate_limiter.acquire().await;
 
-                    let resp = client
+                    let req = client
                         .post(&url)
                         .header("Content-Type", "application/json")
                         .header("Authorization", format!("Bearer {}", api_key))
                         .header("Accept", "text/event-stream")
-                        .json(&current_body)
-                        .send()
-                        .await;
+                        .json(&current_body);
+
+                    // info!("Sending payload to {}: {}", url, serde_json::to_string(&current_body).unwrap_or_default());
+
+                    let resp = req.send().await;
 
                     match resp {
                         Err(e) => {
@@ -170,6 +178,15 @@ impl OpenAICompatProvider {
                             if status >= 400 {
                                 let body_text = response.text().await.unwrap_or_default();
                                 error!("Provider error {}: {}", status, body_text);
+
+                                // Capture payload that triggers unhashable dict error
+                                if status == 500 && body_text.contains("unhashable") {
+                                    error!("Captured unhashable-error payload → failed_payload.json");
+                                    std::fs::write(
+                                        "failed_payload.json",
+                                        serde_json::to_string_pretty(&current_body).unwrap_or_default(),
+                                    ).ok();
+                                }
 
                                 let provider_msg = extract_provider_error(&body_text);
                                 last_error = Some(format!(
@@ -560,7 +577,7 @@ impl OpenAICompatProvider {
         let base_url = get_provider_base_url(provider_type);
         let api_key = get_provider_api_key(provider_type).unwrap_or_default();
 
-        let mut body = build_openai_request(request, model_name);
+        let mut body = build_openai_request(request, model_name, provider_type);
         body.stream = false;
         body.stream_options = None;
 
@@ -573,6 +590,12 @@ impl OpenAICompatProvider {
 
         let _permit = self.rate_limiter.acquire_concurrency().await;
         self.rate_limiter.acquire().await;
+
+        // std::fs::write(
+        //     "openai_payload_debug_nonstream.json",
+        //     serde_json::to_string_pretty(&body).unwrap_or_default(),
+        // )
+        // .ok();
 
         let response = self
             .client

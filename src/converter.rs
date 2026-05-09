@@ -164,7 +164,164 @@ pub fn convert_system_prompt(system: &Option<SystemPrompt>) -> Option<ChatMessag
     }
 }
 
-pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
+/// Aggressively sanitize JSON Schema for NIM/Moonshot backends.
+///
+/// NIM's Python parser crashes with `unhashable type: 'dict'` when it encounters
+/// dict values in positions it tries to hash (e.g. as set elements or dict keys).
+/// This strips ALL known problematic constructs:
+/// - Composition keywords: anyOf, allOf, oneOf (contain arrays of dicts)
+/// - Reference keywords: $schema, $defs, $ref, definitions
+/// - Non-string `type` values (e.g. `["string", "null"]`)
+/// - `default` values that are objects or arrays
+/// - `examples` (array of potentially complex values)
+/// - `const` values that are objects or arrays
+/// - `enum` entries that are objects (keep only primitive enum values)
+/// - `not` keyword (contains a dict)
+/// - `if`/`then`/`else` keywords (contain dicts)
+/// - `prefixItems` (array of dicts, tuple validation)
+fn sanitize_schema_for_nim(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        // Remove composition keywords (arrays of dicts)
+        obj.remove("anyOf");
+        obj.remove("allOf");
+        obj.remove("oneOf");
+        obj.remove("not");
+
+        // Remove reference/meta keywords
+        obj.remove("$schema");
+        obj.remove("$defs");
+        obj.remove("$ref");
+        obj.remove("definitions");
+        obj.remove("$id");
+        obj.remove("$anchor");
+        obj.remove("$dynamicRef");
+        obj.remove("$dynamicAnchor");
+
+        // Remove conditional keywords (contain dicts)
+        obj.remove("if");
+        obj.remove("then");
+        obj.remove("else");
+
+        // Remove tuple validation (array of dicts)
+        obj.remove("prefixItems");
+
+        // Remove examples (array of potentially complex values)
+        obj.remove("examples");
+
+        // If "type" is not a simple string, try to extract first string from array or remove
+        if obj.get("type").is_some_and(|v| !v.is_string()) {
+            let replacement = obj
+                .get("type")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.iter().find_map(|v| v.as_str()))
+                .map(|s| Value::String(s.to_string()));
+            match replacement {
+                Some(val) => {
+                    obj.insert("type".to_string(), val);
+                }
+                None => {
+                    obj.remove("type");
+                }
+            }
+        }
+
+        // Remove `default` if it's an object or array (unhashable)
+        if obj
+            .get("default")
+            .is_some_and(|v| v.is_object() || v.is_array())
+        {
+            obj.remove("default");
+        }
+
+        // Remove `const` if it's an object or array (unhashable)
+        if obj
+            .get("const")
+            .is_some_and(|v| v.is_object() || v.is_array())
+        {
+            obj.remove("const");
+        }
+
+        // Sanitize `enum`: remove any dict/array entries, keep only primitives
+        let enum_is_empty = obj
+            .get_mut("enum")
+            .and_then(|v| v.as_array_mut())
+            .map(|arr| {
+                arr.retain(|v| !v.is_object() && !v.is_array());
+                arr.is_empty()
+            })
+            .unwrap_or(false);
+        if enum_is_empty {
+            obj.remove("enum");
+        }
+
+        // Remove `additionalProperties` if it's a complex object (not a bool)
+        // Keep it if it's `true` or `false`
+        if obj
+            .get("additionalProperties")
+            .is_some_and(|v| v.is_object())
+        {
+            obj.insert("additionalProperties".to_string(), Value::Bool(false));
+        }
+
+        // Recursively sanitize all remaining values
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            if let Some(v) = obj.get_mut(&key) {
+                sanitize_schema_for_nim(v);
+            }
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        for v in arr.iter_mut() {
+            sanitize_schema_for_nim(v);
+        }
+    }
+}
+
+/// Ensure every entry in `required` actually exists in `properties`.
+///
+/// Kimi/Moonshot strictly validates that required properties are defined.
+/// After the NIM sanitizer strips fields, some `required` entries may reference
+/// properties that no longer exist. This function prunes those orphans recursively.
+fn sanitize_required_fields(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        // Get the set of defined property names
+        let defined_props: Vec<String> = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|props| props.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Prune `required` to only contain defined properties
+        let required_is_empty = obj
+            .get_mut("required")
+            .and_then(|v| v.as_array_mut())
+            .map(|arr| {
+                arr.retain(|v| {
+                    v.as_str()
+                        .is_some_and(|name| defined_props.contains(&name.to_string()))
+                });
+                arr.is_empty()
+            })
+            .unwrap_or(false);
+        if required_is_empty {
+            obj.remove("required");
+        }
+
+        // Recurse into all values (properties, items, etc.)
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            if let Some(v) = obj.get_mut(&key) {
+                sanitize_required_fields(v);
+            }
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        for v in arr.iter_mut() {
+            sanitize_required_fields(v);
+        }
+    }
+}
+
+pub fn convert_tools(tools: &[Tool], provider_type: &str) -> Vec<ChatTool> {
     tools
         .iter()
         .map(|t| {
@@ -181,6 +338,15 @@ pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
                     if schema.get("type").is_none() {
                         schema["type"] = serde_json::json!("object");
                     }
+
+                    if provider_type == "nvidia_nim"
+                        || provider_type == "moonshot"
+                        || provider_type == "kimi_oauth"
+                    {
+                        sanitize_schema_for_nim(&mut schema);
+                        sanitize_required_fields(&mut schema);
+                    }
+
                     Some(schema)
                 }
             } else {
@@ -203,7 +369,7 @@ pub fn convert_tools(tools: &[Tool]) -> Vec<ChatTool> {
 ///
 /// Anthropic sends: `{"type": "auto"}`, `{"type": "any"}`, `{"type": "tool", "name": "X"}`
 /// OpenAI expects: `"auto"`, `"required"`, `{"type": "function", "function": {"name": "X"}}`
-pub fn convert_tool_choice(tool_choice: &Option<Value>) -> Option<Value> {
+pub fn convert_tool_choice(tool_choice: &Option<Value>, strict_mode: bool) -> Option<Value> {
     match tool_choice {
         None => None,
         Some(val) => {
@@ -217,14 +383,18 @@ pub fn convert_tool_choice(tool_choice: &Option<Value>) -> Option<Value> {
                     Some("auto") => Some(serde_json::json!("auto")),
                     Some("any") => Some(serde_json::json!("required")),
                     Some("tool") => {
-                        let name = obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        Some(serde_json::json!({
-                            "type": "function",
-                            "function": {"name": name}
-                        }))
+                        if strict_mode {
+                            Some(serde_json::json!("auto"))
+                        } else {
+                            let name = obj
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            Some(serde_json::json!({
+                                "type": "function",
+                                "function": {"name": name}
+                            }))
+                        }
                     }
                     _ => Some(val.clone()),
                 }
@@ -235,15 +405,31 @@ pub fn convert_tool_choice(tool_choice: &Option<Value>) -> Option<Value> {
     }
 }
 
-pub fn build_openai_request(request: &MessagesRequest, model_name: &str) -> ChatCompletionRequest {
+pub fn build_openai_request(
+    request: &MessagesRequest,
+    model_name: &str,
+    provider_type: &str,
+) -> ChatCompletionRequest {
     let mut messages = Vec::new();
     if let Some(sys) = convert_system_prompt(&request.system) {
         messages.push(sys);
     }
     messages.extend(convert_messages(&request.messages));
 
-    let tools = request.tools.as_ref().map(|t| convert_tools(t));
-    let tool_choice = convert_tool_choice(&request.tool_choice);
+    let tools = request
+        .tools
+        .as_ref()
+        .map(|t| convert_tools(t, provider_type));
+    let strict_tool_choice = provider_type == "kimi_oauth"
+        || provider_type == "nvidia_nim"
+        || provider_type == "moonshot";
+    let tool_choice = convert_tool_choice(&request.tool_choice, strict_tool_choice);
+
+    let stream_options = if provider_type == "nvidia_nim" {
+        None
+    } else {
+        Some(serde_json::json!({"include_usage": true}))
+    };
 
     ChatCompletionRequest {
         model: model_name.to_string(),
@@ -255,7 +441,7 @@ pub fn build_openai_request(request: &MessagesRequest, model_name: &str) -> Chat
         stop: request.stop_sequences.clone(),
         tools,
         tool_choice,
-        stream_options: Some(serde_json::json!({"include_usage": true})),
+        stream_options,
     }
 }
 
