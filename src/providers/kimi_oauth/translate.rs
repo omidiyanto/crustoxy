@@ -10,8 +10,8 @@ pub fn build_kimi_request(req: &MessagesRequest, session_id: Option<&str>) -> Va
     let mut body = serde_json::to_value(&openai_req).unwrap_or_else(|_| json!({}));
 
     if let Some(obj) = body.as_object_mut() {
-        // Remove OpenAI specific stream options not needed by Kimi
-        obj.remove("stream_options");
+        // Kimi uses stream_options like OpenAI — keep include_usage
+        obj.insert("stream_options".to_string(), json!({"include_usage": true}));
 
         // 2. Add Kimi-specific fields
         let mut effort = "medium";

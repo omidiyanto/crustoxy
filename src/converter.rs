@@ -277,6 +277,50 @@ fn sanitize_schema_for_nim(schema: &mut Value) {
     }
 }
 
+/// Ensure every entry in `required` actually exists in `properties`.
+///
+/// Kimi/Moonshot strictly validates that required properties are defined.
+/// After the NIM sanitizer strips fields, some `required` entries may reference
+/// properties that no longer exist. This function prunes those orphans recursively.
+fn sanitize_required_fields(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        // Get the set of defined property names
+        let defined_props: Vec<String> = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|props| props.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Prune `required` to only contain defined properties
+        let required_is_empty = obj
+            .get_mut("required")
+            .and_then(|v| v.as_array_mut())
+            .map(|arr| {
+                arr.retain(|v| {
+                    v.as_str()
+                        .is_some_and(|name| defined_props.contains(&name.to_string()))
+                });
+                arr.is_empty()
+            })
+            .unwrap_or(false);
+        if required_is_empty {
+            obj.remove("required");
+        }
+
+        // Recurse into all values (properties, items, etc.)
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            if let Some(v) = obj.get_mut(&key) {
+                sanitize_required_fields(v);
+            }
+        }
+    } else if let Some(arr) = schema.as_array_mut() {
+        for v in arr.iter_mut() {
+            sanitize_required_fields(v);
+        }
+    }
+}
+
 pub fn convert_tools(tools: &[Tool], provider_type: &str) -> Vec<ChatTool> {
     tools
         .iter()
@@ -300,6 +344,7 @@ pub fn convert_tools(tools: &[Tool], provider_type: &str) -> Vec<ChatTool> {
                         || provider_type == "kimi_oauth"
                     {
                         sanitize_schema_for_nim(&mut schema);
+                        sanitize_required_fields(&mut schema);
                     }
 
                     Some(schema)
