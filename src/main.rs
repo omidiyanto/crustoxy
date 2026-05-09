@@ -83,11 +83,19 @@ async fn main() {
         None
     };
 
+    let cloudflare_provider = if settings.cloudflare_api_key.is_some() {
+        info!("CLOUDFLARE_API_KEY detected, initializing Cloudflare provider...");
+        Some(Arc::new(providers::CloudflareProvider::new(&settings)))
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         settings: settings.clone(),
         provider,
         puter_provider,
         kimi_oauth_provider,
+        cloudflare_provider,
     });
 
     let app = Router::new()

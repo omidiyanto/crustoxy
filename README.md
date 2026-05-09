@@ -256,6 +256,7 @@ No need to figure out endpoint definitions. Just pop in your `API_KEY` for any o
 | **Ollama** | `OLLAMA_API_KEY` | `http://localhost:11434/v1` |
 | **Kimi OAuth** | `KIMI_OAUTH_ENABLE` | `https://api.kimi.com/coding/v1` |
 | **SumoPod** | `SUMOPOD_API_KEY` | `https://ai.sumopod.com/v1` |
+| **Cloudflare AI** | `CLOUDFLARE_API_KEY` | `https://api.cloudflare.com/client/v4/accounts` |
 | *...and 10+ more local/cloud services!* | | |
 
 *If you need to use a custom provider, just prefix it with `CUSTOM` inside `.env`.*

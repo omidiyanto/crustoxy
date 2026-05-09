@@ -134,6 +134,11 @@ pub const PROVIDERS: &[ProviderDef] = &[
         default_base_url: "https://ai.sumopod.com/v1",
     },
     ProviderDef {
+        name: "cloudflare",
+        env_prefix: "CLOUDFLARE",
+        default_base_url: "https://api.cloudflare.com/client/v4/accounts",
+    },
+    ProviderDef {
         name: "custom",
         env_prefix: "CUSTOM",
         default_base_url: "",
@@ -176,6 +181,7 @@ pub struct Settings {
     // Puter provider (auto-enabled when puter_api_key is set)
     pub puter_api_key: Option<String>,
     pub kimi_oauth_enable: bool,
+    pub cloudflare_api_key: Option<String>,
 }
 
 impl Settings {
@@ -217,6 +223,7 @@ impl Settings {
             kimi_oauth_enable: env_or("KIMI_OAUTH_ENABLE", "false")
                 .parse()
                 .unwrap_or(false),
+            cloudflare_api_key: env_or_none("CLOUDFLARE_API_KEY"),
         }
     }
 
