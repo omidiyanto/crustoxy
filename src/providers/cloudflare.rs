@@ -8,6 +8,8 @@ use tokio_stream::Stream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::key_pool::KeyPoolManager;
+
 use crate::config::{Settings, get_provider_api_key, get_provider_base_url};
 use crate::converter::{build_openai_request, map_stop_reason};
 use crate::heuristic_tool_parser::HeuristicToolParser;
@@ -55,6 +57,7 @@ impl CloudflareProvider {
         request: &MessagesRequest,
         input_tokens: u32,
         request_id: &str,
+        key_pool: Arc<KeyPoolManager>,
     ) -> impl Stream<Item = String> + use<> {
         let resolved = request
             .resolved_provider_model
@@ -64,21 +67,7 @@ impl CloudflareProvider {
         let provider_type = Settings::parse_provider_type(&resolved).to_string();
         let model_name = Settings::parse_model_name(&resolved).to_string();
         let base_url = get_provider_base_url(&provider_type);
-        let api_key = get_provider_api_key(&provider_type).unwrap_or_default();
         let request_model = request.model.clone();
-
-        let parts: Vec<&str> = api_key.split(':').collect();
-        let account_id = parts.first().unwrap_or(&"").to_string();
-        let auth_token = parts.get(1).unwrap_or(&"").to_string();
-
-        let message_id = format!("msg_{}", Uuid::new_v4());
-        let body = build_openai_request(request, &model_name, &provider_type);
-        let url = format!(
-            "{}/{}/ai/run/{}",
-            base_url.trim_end_matches('/'),
-            account_id,
-            model_name
-        );
 
         let request_id = request_id.to_string();
         let rate_limiter = self.rate_limiter.clone();
@@ -86,23 +75,39 @@ impl CloudflareProvider {
         let _enable_ip_rotation = self.enable_ip_rotation;
         let enable_tool_retry = self.enable_tool_retry;
         let tool_retry_max = self.tool_retry_max;
-
-        info!(
-            "STREAM: request_id={} provider={} model={} msgs={} tools={}",
-            request_id,
-            provider_type,
-            model_name,
-            body.messages.len(),
-            body.tools.as_ref().map_or(0, |t| t.len()),
-        );
-
-        // std::fs::write(
-        //     "openai_payload_debug.json",
-        //     serde_json::to_string_pretty(&body).unwrap_or_default(),
-        // )
-        // .ok();
+        let body = build_openai_request(request, &model_name, &provider_type);
+        let message_id = format!("msg_{}", Uuid::new_v4());
 
         async_stream::stream! {
+            let api_key_full = {
+                let pool_key = key_pool.acquire(&provider_type).await;
+                pool_key
+                    .map(|ep| ep.key.clone())
+                    .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default())
+            };
+
+            let parts: Vec<&str> = api_key_full.split(':').collect();
+            let account_id = parts.first().unwrap_or(&"").to_string();
+            let auth_token = parts.get(1).unwrap_or(&"").to_string();
+            let key_preview = crate::key_pool::mask_key(&api_key_full);
+
+            let url = format!(
+                "{}/{}/ai/run/{}",
+                base_url.trim_end_matches('/'),
+                account_id,
+                model_name
+            );
+
+            info!(
+                "STREAM: request_id={} provider={} model={} key={} msgs={} tools={}",
+                request_id,
+                provider_type,
+                model_name,
+                key_preview,
+                body.messages.len(),
+                body.tools.as_ref().map_or(0, |t| t.len()),
+            );
+
             let mut sse = SSEBuilder::new(message_id, request_model, input_tokens);
             yield sse.message_start();
 
@@ -561,6 +566,7 @@ impl CloudflareProvider {
         request: &MessagesRequest,
         input_tokens: u32,
         request_id: &str,
+        key_pool: Arc<KeyPoolManager>,
     ) -> Result<Value, String> {
         let resolved = request
             .resolved_provider_model
@@ -570,11 +576,18 @@ impl CloudflareProvider {
         let provider_type = Settings::parse_provider_type(&resolved);
         let model_name = Settings::parse_model_name(&resolved);
         let base_url = get_provider_base_url(provider_type);
-        let api_key = get_provider_api_key(provider_type).unwrap_or_default();
 
-        let parts: Vec<&str> = api_key.split(':').collect();
+        // Acquire key from pool, fallback to env var
+        let api_key_full = key_pool
+            .acquire(provider_type)
+            .await
+            .map(|ep| ep.key.clone())
+            .unwrap_or_else(|| get_provider_api_key(provider_type).unwrap_or_default());
+
+        let parts: Vec<&str> = api_key_full.split(':').collect();
         let account_id = parts.first().unwrap_or(&"").to_string();
         let auth_token = parts.get(1).unwrap_or(&"").to_string();
+        let key_preview = crate::key_pool::mask_key(&api_key_full);
 
         let mut body = build_openai_request(request, model_name, provider_type);
         body.stream = false;
@@ -588,8 +601,8 @@ impl CloudflareProvider {
         );
 
         info!(
-            "CF_NON_STREAM: request_id={} provider={} model={}",
-            request_id, provider_type, model_name,
+            "CF_NON_STREAM: request_id={} provider={} model={} key={}",
+            request_id, provider_type, model_name, key_preview,
         );
 
         let _permit = self.rate_limiter.acquire_concurrency().await;

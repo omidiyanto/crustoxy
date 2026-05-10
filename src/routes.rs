@@ -215,7 +215,12 @@ pub async fn create_message(
         if let Some(ref cloudflare_provider) = state.cloudflare_provider {
             if request.stream == Some(false) {
                 let result = cloudflare_provider
-                    .send_non_streaming(&request, input_tokens, &request_id)
+                    .send_non_streaming(
+                        &request,
+                        input_tokens,
+                        &request_id,
+                        state.key_pool_manager.clone(),
+                    )
                     .await;
                 return match result {
                     Ok(response_json) => Json(response_json).into_response(),
@@ -230,7 +235,12 @@ pub async fn create_message(
                 };
             }
 
-            let stream = cloudflare_provider.stream_response(&request, input_tokens, &request_id);
+            let stream = cloudflare_provider.stream_response(
+                &request,
+                input_tokens,
+                &request_id,
+                state.key_pool_manager.clone(),
+            );
             let body_stream =
                 tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
 
