@@ -65,7 +65,10 @@ impl CloudflareProvider {
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
-        let request_model = request.model.clone();
+        let request_model = request
+            .original_model
+            .clone()
+            .unwrap_or_else(|| request.model.clone());
         let original_request = request.clone(); // Keep full request for body rebuilds on fallback
         let request_id = request_id.to_string();
         let rate_limiter = self.rate_limiter.clone();
@@ -626,7 +629,10 @@ impl CloudflareProvider {
         key_pool: Arc<KeyPoolManager>,
         model_router: Arc<crate::model_router::ModelRouter>,
     ) -> Result<Value, String> {
-        let request_model = request.model.clone();
+        let request_model = request
+            .original_model
+            .clone()
+            .unwrap_or_else(|| request.model.clone());
         let mut resolved_spec = request
             .resolved_provider_model
             .clone()

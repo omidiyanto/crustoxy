@@ -66,7 +66,10 @@ impl OpenAICompatProvider {
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
-        let request_model = request.model.clone();
+        let request_model = request
+            .original_model
+            .clone()
+            .unwrap_or_else(|| request.model.clone());
         let original_request = request.clone(); // Keep full request for body rebuilds on fallback
         let message_id = format!("msg_{}", Uuid::new_v4());
         let request_id = request_id.to_string();
@@ -657,7 +660,10 @@ impl OpenAICompatProvider {
         key_pool: Arc<KeyPoolManager>,
         model_router: Arc<ModelRouter>,
     ) -> Result<Value, String> {
-        let request_model = request.model.clone();
+        let request_model = request
+            .original_model
+            .clone()
+            .unwrap_or_else(|| request.model.clone());
         let mut resolved = request
             .resolved_provider_model
             .clone()
