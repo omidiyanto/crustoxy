@@ -444,7 +444,7 @@ impl CloudflareProvider {
                             }
 
                             if last_error.is_some() {
-                                break;
+                                break 'tool_retry;
                             }
 
                             // Flush think parser
