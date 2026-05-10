@@ -674,6 +674,10 @@
       const name = $("#new-prof-name").value.trim();
       const key = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
       if (key && name) {
+        if (config.profiles[key]) {
+          alert("A profile with that name already exists!");
+          return;
+        }
         await api("POST", "/profiles", { key, name });
         await loadAll();
       }
@@ -689,7 +693,11 @@
       html += `<tr>
         <td>${key}</td><td>${prof.name}</td>
         <td>${isActive ? '<span style="color:var(--success)">● ACTIVE</span>' : '<button class="btn btn-sm prof-activate" data-key="' + key + '">ACTIVATE</button>'}</td>
-        <td>${!isActive ? '<span class="model-remove prof-delete" data-key="' + key + '">✕</span>' : ""}</td>
+        <td style="text-align:right">
+          <button class="btn btn-sm prof-rename" data-key="${key}" title="Rename Profile">✎ RENAME</button>
+          <button class="btn btn-sm prof-duplicate" data-key="${key}" title="Duplicate Profile">⧉ DUP</button>
+          ${!isActive ? `<button class="btn btn-sm prof-delete" data-key="${key}" style="color:var(--error);border-color:transparent" title="Delete Profile">✕</button>` : ""}
+        </td>
       </tr>`;
     }
     html += "</table></div>";
@@ -701,10 +709,108 @@
         await loadAll();
       });
     });
+
     el.querySelectorAll(".prof-delete").forEach((btn) => {
       btn.addEventListener("click", async () => {
+        if (!confirm("Are you sure you want to delete this profile?")) return;
         await api("DELETE", "/profiles/" + btn.dataset.key);
         await loadAll();
+      });
+    });
+
+    el.querySelectorAll(".prof-rename").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const oldKey = btn.dataset.key;
+        const prof = config.profiles[oldKey];
+        
+        const modalHtml = `
+          <div class="form-group">
+            <label class="form-label">NEW PROFILE NAME</label>
+            <input id="modal-rename-name" class="form-input" value="${prof.name}">
+          </div>
+          <button id="modal-rename-save" class="btn btn-primary" style="width:100%">RENAME</button>
+        `;
+
+        openModal("Rename Profile", modalHtml, () => {
+          $("#modal-rename-save").addEventListener("click", async () => {
+            const newName = $("#modal-rename-name").value.trim();
+            const newKey = newName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+            
+            if (!newName || !newKey) {
+              alert("Name cannot be empty!");
+              return;
+            }
+
+            if (newKey !== oldKey) {
+              if (config.profiles[newKey]) {
+                alert("A profile with that name/slug already exists!");
+                return;
+              }
+              // Create new profile with copied data
+              config.profiles[newKey] = JSON.parse(JSON.stringify(prof));
+              config.profiles[newKey].name = newName;
+              
+              // Update active profile pointer if needed
+              if (config.general.active_profile === oldKey) {
+                config.general.active_profile = newKey;
+              }
+              
+              // Remove old profile
+              delete config.profiles[oldKey];
+              
+              closeModal();
+              await saveConfig();
+              await loadAll();
+            } else if (newName !== prof.name) {
+              // Just rename the display name (slug hasn't changed)
+              config.profiles[oldKey].name = newName;
+              closeModal();
+              await saveConfig();
+              await loadAll();
+            } else {
+              closeModal();
+            }
+          });
+        });
+      });
+    });
+
+    el.querySelectorAll(".prof-duplicate").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const srcKey = btn.dataset.key;
+        const prof = config.profiles[srcKey];
+        
+        const modalHtml = `
+          <div class="form-group">
+            <label class="form-label">NEW PROFILE NAME</label>
+            <input id="modal-dup-name" class="form-input" value="${prof.name} (Copy)">
+          </div>
+          <button id="modal-dup-save" class="btn btn-primary" style="width:100%">DUPLICATE</button>
+        `;
+
+        openModal("Duplicate Profile", modalHtml, () => {
+          $("#modal-dup-save").addEventListener("click", async () => {
+            const newName = $("#modal-dup-name").value.trim();
+            const newKey = newName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+            
+            if (!newName || !newKey) {
+              alert("Name cannot be empty!");
+              return;
+            }
+
+            if (config.profiles[newKey]) {
+              alert("A profile with that name/slug already exists!");
+              return;
+            }
+
+            config.profiles[newKey] = JSON.parse(JSON.stringify(prof));
+            config.profiles[newKey].name = newName;
+            
+            closeModal();
+            await saveConfig();
+            await loadAll();
+          });
+        });
       });
     });
   }
