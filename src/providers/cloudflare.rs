@@ -58,57 +58,28 @@ impl CloudflareProvider {
         input_tokens: u32,
         request_id: &str,
         key_pool: Arc<KeyPoolManager>,
+        model_router: Arc<crate::model_router::ModelRouter>,
     ) -> impl Stream<Item = String> + use<> {
-        let resolved = request
+        let mut resolved_spec = request
             .resolved_provider_model
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
-        let provider_type = Settings::parse_provider_type(&resolved).to_string();
-        let model_name = Settings::parse_model_name(&resolved).to_string();
-        let base_url = get_provider_base_url(&provider_type);
         let request_model = request.model.clone();
-
         let request_id = request_id.to_string();
         let rate_limiter = self.rate_limiter.clone();
         let client = self.client.clone();
         let _enable_ip_rotation = self.enable_ip_rotation;
         let enable_tool_retry = self.enable_tool_retry;
         let tool_retry_max = self.tool_retry_max;
-        let body = build_openai_request(request, &model_name, &provider_type);
+
+        let initial_provider = Settings::parse_provider_type(&resolved_spec).to_string();
+        let initial_model = Settings::parse_model_name(&resolved_spec).to_string();
+        let mut current_body = build_openai_request(request, &initial_model, &initial_provider);
         let message_id = format!("msg_{}", Uuid::new_v4());
 
         async_stream::stream! {
-            let api_key_full = {
-                let pool_key = key_pool.acquire(&provider_type).await;
-                pool_key
-                    .map(|ep| ep.key.clone())
-                    .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default())
-            };
-
-            let parts: Vec<&str> = api_key_full.split(':').collect();
-            let account_id = parts.first().unwrap_or(&"").to_string();
-            let auth_token = parts.get(1).unwrap_or(&"").to_string();
-            let key_preview = crate::key_pool::mask_key(&api_key_full);
-
-            let url = format!(
-                "{}/{}/ai/run/{}",
-                base_url.trim_end_matches('/'),
-                account_id,
-                model_name
-            );
-
-            info!(
-                "STREAM: request_id={} provider={} model={} key={} msgs={} tools={}",
-                request_id,
-                provider_type,
-                model_name,
-                key_preview,
-                body.messages.len(),
-                body.tools.as_ref().map_or(0, |t| t.len()),
-            );
-
-            let mut sse = SSEBuilder::new(message_id, request_model, input_tokens);
+            let mut sse = SSEBuilder::new(message_id, request_model.clone(), input_tokens);
             yield sse.message_start();
 
             let _permit = rate_limiter.acquire_concurrency().await;
@@ -118,7 +89,6 @@ impl CloudflareProvider {
             // ── DRY retry loop for tool intent recovery ──────────────────
             let max_tool_attempts: u32 = if enable_tool_retry { tool_retry_max + 1 } else { 1 };
             let mut tool_attempt: u32 = 0;
-            let mut current_body = body.clone();
             let mut accumulated_all_text = String::new();
             let mut had_tool_call = false;
             #[allow(unused_assignments)]
@@ -127,82 +97,135 @@ impl CloudflareProvider {
             let mut final_output_tokens: Option<u32> = None;
 
             'tool_retry: while tool_attempt < max_tool_attempts {
-                // ── HTTP retry loop (network errors, 429s, 5xx) ──────────
-                let max_retries: u32 = 3;
-                for attempt in 0..=max_retries {
-                    rate_limiter.acquire().await;
+                let provider_type = Settings::parse_provider_type(&resolved_spec).to_string();
+                let model_name = Settings::parse_model_name(&resolved_spec).to_string();
+                let base_url = get_provider_base_url(&provider_type);
 
-                    info!(
-                        "CF_STREAM_ATTEMPT: request_id={} attempt={}/{} model={}",
-                        request_id, attempt, max_retries, current_body.model
+                // ── 3-tier escalation: key rotation → model fallback → IP rotation ──
+                'key_rotation: loop {
+                    let key_ep = key_pool.acquire(&provider_type).await;
+                    let api_key_full = key_ep.as_ref()
+                        .map(|ep| ep.key.clone())
+                        .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
+
+                    let parts: Vec<&str> = api_key_full.split(':').collect();
+                    let account_id = parts.first().unwrap_or(&"").to_string();
+                    let auth_token = parts.get(1).unwrap_or(&"").to_string();
+                    let key_preview = crate::key_pool::mask_key(&api_key_full);
+
+                    if key_ep.is_none() && key_pool.all_exhausted(&provider_type).await {
+                        // All keys for this provider are on cooldown → escalate to model fallback
+                        warn!(
+                            "ALL_KEYS_EXHAUSTED: provider={} → escalating to model fallback",
+                            provider_type
+                        );
+                        break 'key_rotation;
+                    }
+
+                    let url = format!(
+                        "{}/{}/ai/run/{}",
+                        base_url.trim_end_matches('/'),
+                        account_id,
+                        model_name
                     );
 
-                    let req = client
-                        .post(&url)
-                        .header("Content-Type", "application/json")
-                        .header("Authorization", format!("Bearer {}", auth_token))
-                        .header("Accept", "text/event-stream")
-                        .json(&current_body);
+                    info!(
+                        "CF_STREAM_ATTEMPT: request_id={} provider={} model={} key={} msgs={} tools={}",
+                        request_id, provider_type, model_name, key_preview,
+                        current_body.messages.len(), current_body.tools.as_ref().map_or(0, |t| t.len())
+                    );
 
-                    let resp = req.send().await;
+                    // Level 1: same-key retry for 5xx/timeout only
+                    let max_5xx_retries: u32 = 2;
+                    let mut five_xx_attempt: u32 = 0;
 
-                    match resp {
-                        Err(e) => {
-                            error!("CF_STREAM_ERROR: request_id={} attempt={} error={}", request_id, attempt, e);
-                            last_error = Some(format!("Connection error: {}", e));
-                            if attempt < max_retries {
-                                let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
-                                warn!("Retrying in {:.1}s (attempt {}/{})", delay, attempt + 1, max_retries);
-                                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                                continue;
+                    loop {
+                        rate_limiter.acquire().await;
+
+                        let req = client
+                            .post(&url)
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", format!("Bearer {}", auth_token))
+                            .header("Accept", "text/event-stream")
+                            .json(&current_body);
+
+                        let resp = req.send().await;
+
+                        match resp {
+                            Err(e) => {
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_error(ep, false).await;
+                                }
+                                error!("CF_STREAM_ERROR: request_id={} error={}", request_id, e);
+                                last_error = Some(format!("Connection error: {}", e));
+                                if five_xx_attempt < max_5xx_retries {
+                                    five_xx_attempt += 1;
+                                    let delay = (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
+                                    warn!("Retrying same key in {:.1}s ({}/{})", delay, five_xx_attempt, max_5xx_retries);
+                                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                    continue;
+                                }
+                                continue 'key_rotation;
                             }
-                        }
-                        Ok(response) => {
-                            let status = response.status().as_u16();
+                            Ok(response) => {
+                                let status = response.status().as_u16();
 
-                            if status == 429 {
-                                warn!(
-                                    "CF_RATE_LIMITED: request_id={} attempt={}/{}",
-                                    request_id, attempt, max_retries
+                                if status == 429 {
+                                    if let Some(ep) = &key_ep {
+                                        key_pool.report_error(ep, true).await;
+                                    }
+                                    warn!(
+                                        "CF_RATE_LIMITED: request_id={} provider={} key={} → rotating key",
+                                        request_id, provider_type, key_preview
+                                    );
+                                    last_error = Some(format!("Rate limit (429) on key {}", key_preview));
+                                    continue 'key_rotation;
+                                }
+
+                                if status >= 400 {
+                                    let body_text = response.text().await.unwrap_or_default();
+                                    error!("Provider error {}: {}", status, body_text);
+
+                                    if status == 500 && body_text.contains("unhashable") {
+                                        error!("Captured unhashable-error payload → failed_payload.json");
+                                        std::fs::write(
+                                            "failed_payload.json",
+                                            serde_json::to_string_pretty(&current_body).unwrap_or_default(),
+                                        ).ok();
+                                    }
+
+                                    let provider_msg = extract_provider_error(&body_text);
+                                    last_error = Some(format!(
+                                        "Provider returned status {} (request_id={}): {}",
+                                        status, request_id, provider_msg
+                                    ));
+
+                                    if status >= 500 {
+                                        if let Some(ep) = &key_ep {
+                                            key_pool.report_error(ep, false).await;
+                                        }
+                                        if five_xx_attempt < max_5xx_retries {
+                                            five_xx_attempt += 1;
+                                            let delay = (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
+                                            warn!("5xx retry same key in {:.1}s ({}/{})", delay, five_xx_attempt, max_5xx_retries);
+                                            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                            continue;
+                                        }
+                                        continue 'key_rotation;
+                                    }
+                                    break 'key_rotation;
+                                }
+
+                                if let Some(ep) = &key_ep {
+                                    // Report success (approximated latency, can be enhanced)
+                                    key_pool.report_success(ep, 100).await;
+                                }
+                                info!(
+                                    "CF_STREAM_OK: request_id={} provider={} model={} key={}",
+                                    request_id, provider_type, model_name, key_preview
                                 );
-                                last_error = Some("Cloudflare rate limit (429)".to_string());
-                                if attempt < max_retries {
-                                    let delay = (2u64.pow(attempt) * 2) as f64 + rand_jitter();
-                                    warn!("429 retry in {:.1}s (attempt {}/{})", delay, attempt + 1, max_retries);
-                                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                                    continue;
-                                }
-                                // All retries exhausted — NO premature IP rotation
-                                break;
-                            }
 
-                            if status >= 400 {
-                                let body_text = response.text().await.unwrap_or_default();
-                                error!("Provider error {}: {}", status, body_text);
-
-                                if status == 500 && body_text.contains("unhashable") {
-                                    error!("Captured unhashable-error payload → failed_payload.json");
-                                    std::fs::write(
-                                        "failed_payload.json",
-                                        serde_json::to_string_pretty(&current_body).unwrap_or_default(),
-                                    ).ok();
-                                }
-
-                                let provider_msg = extract_provider_error(&body_text);
-                                last_error = Some(format!(
-                                    "Provider returned status {} (request_id={}): {}",
-                                    status, request_id, provider_msg
-                                ));
-
-                                if status >= 500 && attempt < max_retries {
-                                    let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
-                                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                                    continue;
-                                }
-                                break;
-                            }
-
-                            // ── Successful response: process stream ──────────
+                                // ── Successful response: process stream ──────────
                             let mut think_parser = ThinkTagParser::new();
                             let mut heuristic_parser = HeuristicToolParser::new();
                             let mut finish_reason: Option<String> = None;
@@ -533,11 +556,38 @@ impl CloudflareProvider {
                             yield sse.message_delta(stop, output_tokens);
                             yield sse.message_stop();
                             return;
-                        }
+                                } // end Ok(response)
+                            } // end match resp
+                        } // end inner 5xx loop
+                    } // end 'key_rotation
+
+                // ── Model fallback: all keys for current provider exhausted ──
+                model_router.report_error_by_spec(&resolved_spec).await;
+                if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
+                    warn!(
+                        "MODEL_FALLBACK: {} → {} (all keys for {} exhausted)",
+                        resolved_spec, next_ep.full_spec,
+                        Settings::parse_provider_type(&resolved_spec),
+                    );
+                    resolved_spec = next_ep.full_spec.clone();
+                    current_body.model = next_ep.model_name.clone();
+                    continue 'tool_retry;
+                }
+
+                // If ALL fallback models are also exhausted, trigger IP rotation if enabled
+                if _enable_ip_rotation {
+                    warn!(
+                        "ALL_MODELS_EXHAUSTED: request_id={} → Triggering WARP IP Rotation as last resort!",
+                        request_id
+                    );
+                    if let Err(e) = crate::ip_rotator::rotate_ip().await {
+                        error!("IP Rotation failed: {}", e);
+                    } else {
+                        info!("IP Rotation requested successfully");
                     }
                 }
 
-                // If we reached here from error path, break the tool retry loop too
+                // If we reached here from error path, break the tool retry loop
                 break 'tool_retry;
             }
 
@@ -567,210 +617,269 @@ impl CloudflareProvider {
         input_tokens: u32,
         request_id: &str,
         key_pool: Arc<KeyPoolManager>,
+        model_router: Arc<crate::model_router::ModelRouter>,
     ) -> Result<Value, String> {
-        let resolved = request
+        let request_model = request.model.clone();
+        let mut resolved_spec = request
             .resolved_provider_model
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
-        let provider_type = Settings::parse_provider_type(&resolved);
-        let model_name = Settings::parse_model_name(&resolved);
-        let base_url = get_provider_base_url(provider_type);
-
-        // Acquire key from pool, fallback to env var
-        let api_key_full = key_pool
-            .acquire(provider_type)
-            .await
-            .map(|ep| ep.key.clone())
-            .unwrap_or_else(|| get_provider_api_key(provider_type).unwrap_or_default());
-
-        let parts: Vec<&str> = api_key_full.split(':').collect();
-        let account_id = parts.first().unwrap_or(&"").to_string();
-        let auth_token = parts.get(1).unwrap_or(&"").to_string();
-        let key_preview = crate::key_pool::mask_key(&api_key_full);
-
-        let mut body = build_openai_request(request, model_name, provider_type);
-        body.stream = false;
-        body.stream_options = None;
-
-        let url = format!(
-            "{}/{}/ai/run/{}",
-            base_url.trim_end_matches('/'),
-            account_id,
-            model_name
-        );
-
-        info!(
-            "CF_NON_STREAM: request_id={} provider={} model={} key={}",
-            request_id, provider_type, model_name, key_preview,
-        );
-
         let _permit = self.rate_limiter.acquire_concurrency().await;
-
-        let max_retries: u32 = 2;
         let mut last_error = String::new();
 
-        for attempt in 0..=max_retries {
-            self.rate_limiter.acquire().await;
+        // Model fallback loop
+        'model_fallback: loop {
+            let provider_type = Settings::parse_provider_type(&resolved_spec).to_string();
+            let model_name = Settings::parse_model_name(&resolved_spec).to_string();
+            let base_url = get_provider_base_url(&provider_type);
 
-            info!(
-                "CF_NON_STREAM_ATTEMPT: request_id={} attempt={}/{}",
-                request_id, attempt, max_retries
-            );
+            let mut body = build_openai_request(request, &model_name, &provider_type);
+            body.stream = false;
+            body.stream_options = None;
 
-            let resp = self
-                .client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", auth_token))
-                .json(&body)
-                .send()
-                .await;
+            // ── Key rotation loop ──
+            'key_rotation: loop {
+                let key_ep = key_pool.acquire(&provider_type).await;
+                let api_key_full = key_ep
+                    .as_ref()
+                    .map(|ep| ep.key.clone())
+                    .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
 
-            match resp {
-                Err(e) => {
-                    last_error = format!("Connection error: {}", e);
-                    if attempt < max_retries {
-                        let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
-                        tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                        continue;
-                    }
-                    return Err(last_error);
+                let parts: Vec<&str> = api_key_full.split(':').collect();
+                let account_id = parts.first().unwrap_or(&"").to_string();
+                let auth_token = parts.get(1).unwrap_or(&"").to_string();
+                let key_preview = crate::key_pool::mask_key(&api_key_full);
+
+                if key_ep.is_none() && key_pool.all_exhausted(&provider_type).await {
+                    warn!(
+                        "ALL_KEYS_EXHAUSTED: provider={} → escalating to model fallback",
+                        provider_type
+                    );
+                    break 'key_rotation;
                 }
-                Ok(response) => {
-                    let status = response.status().as_u16();
 
-                    if status == 429 {
-                        warn!(
-                            "CF_RATE_LIMITED: request_id={} attempt={}/{}",
-                            request_id, attempt, max_retries
-                        );
-                        last_error = "Cloudflare rate limit (429)".to_string();
-                        if attempt < max_retries {
-                            let delay = (2u64.pow(attempt) * 2) as f64 + rand_jitter();
-                            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                            continue;
+                let url = format!(
+                    "{}/{}/ai/run/{}",
+                    base_url.trim_end_matches('/'),
+                    account_id,
+                    model_name
+                );
+
+                info!(
+                    "CF_NON_STREAM_ATTEMPT: request_id={} provider={} model={} key={}",
+                    request_id, provider_type, model_name, key_preview
+                );
+
+                // Level 1: same-key retry for 5xx/timeout only
+                let max_5xx_retries: u32 = 2;
+                let mut five_xx_attempt: u32 = 0;
+
+                loop {
+                    self.rate_limiter.acquire().await;
+
+                    let resp = self
+                        .client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", format!("Bearer {}", auth_token))
+                        .json(&body)
+                        .send()
+                        .await;
+
+                    match resp {
+                        Err(e) => {
+                            if let Some(ep) = &key_ep {
+                                key_pool.report_error(ep, false).await;
+                            }
+                            last_error = format!("Connection error: {}", e);
+                            if five_xx_attempt < max_5xx_retries {
+                                five_xx_attempt += 1;
+                                let delay = (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
+                                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                continue;
+                            }
+                            continue 'key_rotation;
                         }
-                        // All retries exhausted — NO premature IP rotation
-                        return Err(last_error);
-                    }
+                        Ok(response) => {
+                            let status = response.status().as_u16();
 
-                    if status >= 400 {
-                        let body_text = response.text().await.unwrap_or_default();
-                        let msg = extract_provider_error(&body_text);
-                        last_error = format!("Provider returned status {}: {}", status, msg);
-                        if status >= 500 && attempt < max_retries {
-                            let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
-                            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                            continue;
-                        }
-                        return Err(last_error);
-                    }
-
-                    // ── Success: parse response ──
-                    let resp_body: Value = response
-                        .json()
-                        .await
-                        .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-                    // Convert OpenAI ChatCompletion → Anthropic MessagesResponse
-                    let message_id = format!("msg_{}", Uuid::new_v4());
-                    let choice = resp_body
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .ok_or("No choices in response")?;
-
-                    let message = choice.get("message").ok_or("No message in choice")?;
-                    let finish = choice
-                        .get("finish_reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("stop");
-
-                    let mut content_blocks: Vec<Value> = Vec::new();
-
-                    if let Some(text) = message.get("content").and_then(|v| v.as_str())
-                        && !text.is_empty()
-                    {
-                        content_blocks.push(json!({"type": "text", "text": text}));
-                    }
-
-                    let reasoning_val = message
-                        .get("reasoning_content")
-                        .or_else(|| message.get("reasoning"));
-                    if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
-                        && !reasoning.is_empty()
-                    {
-                        content_blocks.push(json!({"type": "thinking", "thinking": reasoning}));
-                    }
-
-                    if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
-                        for tc in tool_calls {
-                            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                            let name = tc
-                                .get("function")
-                                .and_then(|f| f.get("name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let args_str = tc
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("{}");
-                            let input: Value = match serde_json::from_str(args_str) {
-                                Ok(val) => val,
-                                Err(_) => {
-                                    let garbled = format!(
-                                        r#"{{"name": "{}", "arguments": {}}}"#,
-                                        name, args_str
-                                    );
-                                    crate::heuristic_tool_parser::recover_garbled_tool_json(
-                                        &garbled,
-                                    )
-                                    .map(|rec| serde_json::Value::Object(rec.arguments))
-                                    .unwrap_or_else(|| json!({}))
+                            if status == 429 {
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_error(ep, true).await;
                                 }
-                            };
-                            content_blocks.push(json!({
-                                "type": "tool_use",
-                                "id": id,
-                                "name": name,
-                                "input": input
+                                warn!(
+                                    "CF_RATE_LIMITED: request_id={} provider={} key={} → rotating key",
+                                    request_id, provider_type, key_preview
+                                );
+                                last_error = format!("Rate limit (429) on key {}", key_preview);
+                                continue 'key_rotation;
+                            }
+
+                            if status >= 400 {
+                                let body_text = response.text().await.unwrap_or_default();
+                                let msg = extract_provider_error(&body_text);
+                                last_error =
+                                    format!("Provider returned status {}: {}", status, msg);
+                                if status >= 500 {
+                                    if let Some(ep) = &key_ep {
+                                        key_pool.report_error(ep, false).await;
+                                    }
+                                    if five_xx_attempt < max_5xx_retries {
+                                        five_xx_attempt += 1;
+                                        let delay =
+                                            (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
+                                        tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                        continue;
+                                    }
+                                    continue 'key_rotation;
+                                }
+                                break 'key_rotation;
+                            }
+
+                            if let Some(ep) = &key_ep {
+                                key_pool.report_success(ep, 100).await;
+                            }
+
+                            // ── Success: parse response ──
+                            let resp_body: Value = response
+                                .json()
+                                .await
+                                .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+                            // Convert OpenAI ChatCompletion → Anthropic MessagesResponse
+                            let message_id = format!("msg_{}", Uuid::new_v4());
+                            let choice = resp_body
+                                .get("choices")
+                                .and_then(|c| c.get(0))
+                                .ok_or("No choices in response")?;
+
+                            let message = choice.get("message").ok_or("No message in choice")?;
+                            let finish = choice
+                                .get("finish_reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("stop");
+
+                            let mut content_blocks: Vec<Value> = Vec::new();
+
+                            if let Some(text) = message.get("content").and_then(|v| v.as_str())
+                                && !text.is_empty()
+                            {
+                                content_blocks.push(json!({"type": "text", "text": text}));
+                            }
+
+                            let reasoning_val = message
+                                .get("reasoning_content")
+                                .or_else(|| message.get("reasoning"));
+                            if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
+                                && !reasoning.is_empty()
+                            {
+                                content_blocks
+                                    .push(json!({"type": "thinking", "thinking": reasoning}));
+                            }
+
+                            if let Some(tool_calls) =
+                                message.get("tool_calls").and_then(|v| v.as_array())
+                            {
+                                for tc in tool_calls {
+                                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let args_str = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("{}");
+                                    let input: Value = match serde_json::from_str(args_str) {
+                                        Ok(val) => val,
+                                        Err(_) => {
+                                            let garbled = format!(
+                                                r#"{{"name": "{}", "arguments": {}}}"#,
+                                                name, args_str
+                                            );
+                                            crate::heuristic_tool_parser::recover_garbled_tool_json(
+                                                &garbled,
+                                            )
+                                            .map(|rec| serde_json::Value::Object(rec.arguments))
+                                            .unwrap_or_else(|| json!({}))
+                                        }
+                                    };
+                                    content_blocks.push(json!({
+                                        "type": "tool_use",
+                                        "id": id,
+                                        "name": name,
+                                        "input": input
+                                    }));
+                                }
+                            }
+
+                            if content_blocks.is_empty() {
+                                content_blocks.push(json!({"type": "text", "text": " "}));
+                            }
+
+                            let usage = resp_body.get("usage");
+                            let output_tokens = usage
+                                .and_then(|u| u.get("completion_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1)
+                                as u32;
+
+                            let stop_reason = map_stop_reason(Some(finish));
+
+                            return Ok(json!({
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "model": request.model,
+                                "content": content_blocks,
+                                "stop_reason": stop_reason,
+                                "stop_sequence": null,
+                                "usage": {
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": output_tokens,
+                                    "cache_creation_input_tokens": 0,
+                                    "cache_read_input_tokens": 0
+                                }
                             }));
                         }
                     }
-
-                    if content_blocks.is_empty() {
-                        content_blocks.push(json!({"type": "text", "text": " "}));
-                    }
-
-                    let usage = resp_body.get("usage");
-                    let output_tokens = usage
-                        .and_then(|u| u.get("completion_tokens"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(1) as u32;
-
-                    let stop_reason = map_stop_reason(Some(finish));
-
-                    return Ok(json!({
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": request.model,
-                        "content": content_blocks,
-                        "stop_reason": stop_reason,
-                        "stop_sequence": null,
-                        "usage": {
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0
-                        }
-                    }));
                 }
             }
-        }
 
-        Err(last_error)
+            // ── Model fallback: all keys for current provider exhausted ──
+            model_router.report_error_by_spec(&resolved_spec).await;
+            if let Some(next_ep) = model_router
+                .next_fallback(&request_model, &resolved_spec)
+                .await
+            {
+                warn!(
+                    "MODEL_FALLBACK: {} → {} (all keys for {} exhausted)",
+                    resolved_spec,
+                    next_ep.full_spec,
+                    Settings::parse_provider_type(&resolved_spec),
+                );
+                resolved_spec = next_ep.full_spec.clone();
+                continue 'model_fallback;
+            }
+
+            // If ALL fallback models are also exhausted, trigger IP rotation if enabled
+            if self.enable_ip_rotation {
+                warn!(
+                    "ALL_MODELS_EXHAUSTED: request_id={} → Triggering WARP IP Rotation as last resort!",
+                    request_id
+                );
+                if let Err(e) = crate::ip_rotator::rotate_ip().await {
+                    error!("IP Rotation failed: {}", e);
+                } else {
+                    info!("IP Rotation requested successfully");
+                }
+            }
+
+            return Err(last_error);
+        }
     }
 }
 

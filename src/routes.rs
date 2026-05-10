@@ -220,6 +220,7 @@ pub async fn create_message(
                         input_tokens,
                         &request_id,
                         state.key_pool_manager.clone(),
+                        state.model_router.clone(),
                     )
                     .await;
                 return match result {
@@ -240,6 +241,7 @@ pub async fn create_message(
                 input_tokens,
                 &request_id,
                 state.key_pool_manager.clone(),
+                state.model_router.clone(),
             );
             let body_stream =
                 tokio_stream::StreamExt::map(stream, Ok::<_, std::convert::Infallible>);
