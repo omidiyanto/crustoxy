@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::config::{Settings, get_provider_api_key, get_provider_base_url};
 use crate::converter::{build_openai_request, map_stop_reason};
 use crate::heuristic_tool_parser::HeuristicToolParser;
-use crate::ip_rotator;
 use crate::models::anthropic::MessagesRequest;
 use crate::models::openai::{ChatCompletionChunk, ChatMessage};
 use crate::rate_limiter::RateLimiter;
@@ -84,7 +83,7 @@ impl CloudflareProvider {
         let request_id = request_id.to_string();
         let rate_limiter = self.rate_limiter.clone();
         let client = self.client.clone();
-        let enable_ip_rotation = self.enable_ip_rotation;
+        let _enable_ip_rotation = self.enable_ip_rotation;
         let enable_tool_retry = self.enable_tool_retry;
         let tool_retry_max = self.tool_retry_max;
 
@@ -109,12 +108,9 @@ impl CloudflareProvider {
 
             let _permit = rate_limiter.acquire_concurrency().await;
 
-            let max_retries: u32 = 3;
             let mut last_error: Option<String> = None;
 
             // ── DRY retry loop for tool intent recovery ──────────────────
-            // max_tool_attempts: 1 = no retry (existing behavior)
-            // When enable_tool_retry is true, we allow up to tool_retry_max + 1 attempts.
             let max_tool_attempts: u32 = if enable_tool_retry { tool_retry_max + 1 } else { 1 };
             let mut tool_attempt: u32 = 0;
             let mut current_body = body.clone();
@@ -127,8 +123,14 @@ impl CloudflareProvider {
 
             'tool_retry: while tool_attempt < max_tool_attempts {
                 // ── HTTP retry loop (network errors, 429s, 5xx) ──────────
+                let max_retries: u32 = 3;
                 for attempt in 0..=max_retries {
                     rate_limiter.acquire().await;
+
+                    info!(
+                        "CF_STREAM_ATTEMPT: request_id={} attempt={}/{} model={}",
+                        request_id, attempt, max_retries, current_body.model
+                    );
 
                     let req = client
                         .post(&url)
@@ -137,13 +139,11 @@ impl CloudflareProvider {
                         .header("Accept", "text/event-stream")
                         .json(&current_body);
 
-                    // info!("Sending payload to {}: {}", url, serde_json::to_string(&current_body).unwrap_or_default());
-
                     let resp = req.send().await;
 
                     match resp {
                         Err(e) => {
-                            error!("STREAM_ERROR: request_id={} attempt={} error={}", request_id, attempt, e);
+                            error!("CF_STREAM_ERROR: request_id={} attempt={} error={}", request_id, attempt, e);
                             last_error = Some(format!("Connection error: {}", e));
                             if attempt < max_retries {
                                 let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
@@ -156,31 +156,18 @@ impl CloudflareProvider {
                             let status = response.status().as_u16();
 
                             if status == 429 {
-                                warn!("Rate limited (429): request_id={} attempt={}", request_id, attempt);
-
+                                warn!(
+                                    "CF_RATE_LIMITED: request_id={} attempt={}/{}",
+                                    request_id, attempt, max_retries
+                                );
+                                last_error = Some("Cloudflare rate limit (429)".to_string());
                                 if attempt < max_retries {
                                     let delay = (2u64.pow(attempt) * 2) as f64 + rand_jitter();
-                                    warn!("Retrying in {:.1}s (attempt {}/{})", delay, attempt + 1, max_retries);
-                                    rate_limiter.set_blocked(delay).await;
+                                    warn!("429 retry in {:.1}s (attempt {}/{})", delay, attempt + 1, max_retries);
                                     tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                     continue;
                                 }
-
-                                warn!("All retries exhausted. Setting strict block and initiating IP rotation...");
-                                rate_limiter.set_blocked(60.0).await;
-
-                                if enable_ip_rotation {
-                                    let rl = rate_limiter.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = ip_rotator::rotate_ip().await {
-                                            error!("IP rotation failed: {}", e);
-                                        } else {
-                                            rl.clear_block().await;
-                                        }
-                                    });
-                                }
-
-                                last_error = Some("Rate limit exceeded. Retries exhausted.".to_string());
+                                // All retries exhausted — NO premature IP rotation
                                 break;
                             }
 
@@ -188,7 +175,6 @@ impl CloudflareProvider {
                                 let body_text = response.text().await.unwrap_or_default();
                                 error!("Provider error {}: {}", status, body_text);
 
-                                // Capture payload that triggers unhashable dict error
                                 if status == 500 && body_text.contains("unhashable") {
                                     error!("Captured unhashable-error payload → failed_payload.json");
                                     std::fs::write(
@@ -602,7 +588,7 @@ impl CloudflareProvider {
         );
 
         info!(
-            "NON_STREAM: request_id={} provider={} model={}",
+            "CF_NON_STREAM: request_id={} provider={} model={}",
             request_id, provider_type, model_name,
         );
 
@@ -613,6 +599,11 @@ impl CloudflareProvider {
 
         for attempt in 0..=max_retries {
             self.rate_limiter.acquire().await;
+
+            info!(
+                "CF_NON_STREAM_ATTEMPT: request_id={} attempt={}/{}",
+                request_id, attempt, max_retries
+            );
 
             let resp = self
                 .client
@@ -638,26 +629,16 @@ impl CloudflareProvider {
 
                     if status == 429 {
                         warn!(
-                            "Rate limited (429): request_id={} attempt={}",
-                            request_id, attempt
+                            "CF_RATE_LIMITED: request_id={} attempt={}/{}",
+                            request_id, attempt, max_retries
                         );
-                        last_error = "Rate limit exceeded".to_string();
+                        last_error = "Cloudflare rate limit (429)".to_string();
                         if attempt < max_retries {
                             let delay = (2u64.pow(attempt) * 2) as f64 + rand_jitter();
-                            self.rate_limiter.set_blocked(delay).await;
                             tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                             continue;
                         }
-                        if self.enable_ip_rotation {
-                            let rl = self.rate_limiter.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = ip_rotator::rotate_ip().await {
-                                    error!("IP rotation failed: {}", e);
-                                } else {
-                                    rl.clear_block().await;
-                                }
-                            });
-                        }
+                        // All retries exhausted — NO premature IP rotation
                         return Err(last_error);
                     }
 

@@ -223,6 +223,125 @@ No need to figure out endpoint definitions. Just enter your API keys into the We
 
 ---
 
+## 🔀 Auto-Routing, Fallback & Load Balancing Architecture
+
+Crustoxy implements a **dual-dimension load balancing** system combined with a **3-tier error escalation hierarchy** to maximize uptime and API utilization. This ensures that a single rate-limited key or downed provider never halts your Claude Code session.
+
+### How It Works
+
+There are two independent axes of load balancing happening simultaneously:
+
+| Dimension | What It Balances | Configured Via |
+| :--- | :--- | :--- |
+| **Model Routing** | Distributes requests across multiple `provider/model` combinations per Claude tier | `MODEL_OPUS`, `MODEL_SONNET`, `MODEL_HAIKU` |
+| **Key Pool Rotation** | Distributes requests across multiple API keys per provider | Provider API Keys |
+
+**Example configuration:**
+```toml
+# Model tier with 2 providers (round-robin between them)
+MODEL_SONNET = "openrouter/deepseek-r1 ; deepinfra/deepseek-r1"
+
+# Each provider has its own key pool (round-robin per provider)
+OPENROUTER_API_KEY = "sk-or-key-A ; sk-or-key-B ; sk-or-key-C"
+DEEPINFRA_API_KEY  = "di-key-X ; di-key-Y"
+```
+
+With this config, Crustoxy will:
+1. Alternate between `openrouter` and `deepinfra` for Sonnet-tier requests (model routing).
+2. Within OpenRouter, cycle through keys A → B → C (key pool rotation).
+3. Within DeepInfra, cycle through keys X → Y.
+
+### 3-Tier Error Escalation Hierarchy
+
+When a request fails (e.g., HTTP `429 Rate Limit`), Crustoxy does **NOT** immediately rotate the IP or block globally. Instead, it follows a precise escalation ladder:
+
+```mermaid
+flowchart TD
+    A["📤 Incoming Request"] --> B["🔑 Acquire API Key<br/>(Round-Robin from Key Pool)"]
+    B --> C["🌐 Send to Provider"]
+    C --> D{Response?}
+
+    D -->|"✅ 2xx Success"| E["✅ Return Response<br/>Reset key health"]
+    D -->|"⚡ 5xx / Timeout"| F["🔄 Tier 1: Same-Key Retry<br/>(max 2x, exp backoff)"]
+    D -->|"🚫 429 Rate Limit"| G["⏸️ Cooldown This Key<br/>(Exponential: 60s → 120s → 240s → 300s cap)"]
+    D -->|"❌ 4xx Auth Error"| H["🛑 Abort — Non-Retriable"]
+
+    F --> I{Retry OK?}
+    I -->|Yes| E
+    I -->|"No (exhausted)"| G
+
+    G --> J["🔄 Tier 2: Rotate to Next Key<br/>(Round-Robin in Key Pool)"]
+    J --> K{Any Healthy<br/>Key Left?}
+    K -->|Yes| C
+    K -->|"No (All Exhausted)"| L["🔄 Tier 3: Model Fallback<br/>(Switch to next provider/model)"]
+
+    L --> M{Fallback<br/>Available?}
+    M -->|Yes| B
+    M -->|"No (All Models Down)"| N["🌍 Last Resort: WARP IP Rotation<br/>(Only if ALL keys AND ALL models exhausted)"]
+    N --> O["⚠️ Return Error to Client"]
+
+    style E fill:#2d6a4f,color:#fff
+    style H fill:#9d0208,color:#fff
+    style O fill:#9d0208,color:#fff
+    style G fill:#e9c46a,color:#000
+    style L fill:#264653,color:#fff
+    style N fill:#6c3461,color:#fff
+```
+
+### Escalation Tiers Explained
+
+#### Tier 1 — Same-Key Retry (5xx / Timeout only)
+When a provider returns a server error (`500`, `502`, `503`) or times out, Crustoxy retries the **same API key** up to 2 times with exponential backoff + jitter. This handles transient provider hiccups.
+
+> **Important:** `429 Rate Limit` errors **skip** this tier entirely. A 429 means the key is rate-limited, so retrying the same key is pointless.
+
+#### Tier 2 — Key Pool Rotation (429 Rate Limit)
+When a key gets a `429`, it is immediately placed on an **exponential cooldown**:
+
+| Occurrence | Cooldown Duration |
+| :---: | :---: |
+| 1st rate limit | 60 seconds |
+| 2nd rate limit | 120 seconds |
+| 3rd rate limit | 240 seconds |
+| 4th+ rate limit | 300 seconds (5 min cap) |
+
+The proxy then transparently rotates to the **next healthy key** in the pool (round-robin). Once the cooldown expires, the key automatically rejoins the healthy pool. A successful request resets the escalation counter.
+
+#### Tier 3 — Model / Provider Fallback
+If **all keys** for a specific provider are on cooldown (exhausted), Crustoxy escalates to the **model router** and switches to the next provider/model combination:
+
+```
+openrouter/deepseek-r1 (ALL KEYS EXHAUSTED)
+    → fallback to: deepinfra/deepseek-r1
+```
+
+This is seamless and mid-stream safe — the client never knows a provider switch occurred.
+
+#### Last Resort — WARP IP Rotation
+Only when **ALL models AND ALL keys** across every configured provider are exhausted does Crustoxy trigger an IP rotation via `warp-cli`. This is the nuclear option and is intentionally hard to reach.
+
+### Detailed Logging
+
+Every request attempt logs the **provider**, **model**, and **masked API key** for full observability:
+
+```
+INFO  STREAM_ATTEMPT: request_id=req_abc provider=openrouter model=deepseek-r1 key=sk-...key
+WARN  RATE_LIMITED:    request_id=req_abc provider=openrouter key=sk-...key → rotating key
+WARN  Key sk-...key (openrouter) placed on 60s cooldown (rate limited, escalation=1)
+INFO  STREAM_ATTEMPT: request_id=req_abc provider=openrouter model=deepseek-r1 key=ghs...xyz
+INFO  STREAM_OK:       request_id=req_abc provider=openrouter model=deepseek-r1 key=ghs...xyz
+```
+
+When model fallback triggers:
+```
+WARN  ALL_KEYS_EXHAUSTED: provider=openrouter → escalating to model fallback
+WARN  MODEL_FALLBACK: openrouter/deepseek-r1 → deepinfra/deepseek-r1 (all keys for openrouter exhausted)
+INFO  STREAM_ATTEMPT: request_id=req_abc provider=deepinfra model=deepseek-r1 key=di-...abc
+INFO  STREAM_OK:       request_id=req_abc provider=deepinfra model=deepseek-r1 key=di-...abc
+```
+
+---
+
 ## 🔄 WARP IP Rotation Mode
 
 When `ENABLE_IP_ROTATION=true` in `.env`, the router will actively communicate with a local Cloudflare WARP daemon. 

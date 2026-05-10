@@ -22,6 +22,8 @@ pub struct KeyEndpoint {
     pub provider: String,
     pub healthy: AtomicBool,
     pub consecutive_errors: AtomicU32,
+    /// Tracks how many times this key has entered cooldown (for exponential backoff).
+    pub cooldown_count: AtomicU32,
     pub cooldown_until: Mutex<Option<Instant>>,
     pub total_requests: AtomicU64,
     pub total_errors: AtomicU64,
@@ -61,6 +63,7 @@ impl KeyPool {
                     provider: provider.clone(),
                     healthy: AtomicBool::new(true),
                     consecutive_errors: AtomicU32::new(0),
+                    cooldown_count: AtomicU32::new(0),
                     cooldown_until: Mutex::new(None),
                     total_requests: AtomicU64::new(0),
                     total_errors: AtomicU64::new(0),
@@ -173,9 +176,10 @@ impl KeyPool {
         false
     }
 
-    /// Report a successful request — resets error counter.
+    /// Report a successful request — resets error counter and cooldown escalation.
     pub fn report_success(&self, endpoint: &KeyEndpoint, latency_ms: u64) {
         endpoint.consecutive_errors.store(0, Ordering::Relaxed);
+        endpoint.cooldown_count.store(0, Ordering::Relaxed);
         endpoint.healthy.store(true, Ordering::Relaxed);
         endpoint
             .last_latency_ms
@@ -183,13 +187,21 @@ impl KeyPool {
     }
 
     /// Report an error — increments counter, may trigger cooldown.
+    /// Uses **exponential cooldown** for rate limits: `base * 2^(n-1)`, capped at 300s.
     pub async fn report_error(&self, endpoint: &KeyEndpoint, is_rate_limit: bool) {
         endpoint.total_errors.fetch_add(1, Ordering::Relaxed);
         let errors = endpoint.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
 
         if is_rate_limit || errors >= self.max_consecutive_errors {
+            // Increment cooldown count for exponential backoff
+            let cd_count = endpoint.cooldown_count.fetch_add(1, Ordering::Relaxed) + 1;
+
             let cooldown = if is_rate_limit {
-                self.cooldown_seconds
+                // Exponential: base * 2^(n-1), capped at 300s (5 min)
+                let exp = self
+                    .cooldown_seconds
+                    .saturating_mul(2u64.saturating_pow(cd_count.saturating_sub(1)));
+                exp.min(300)
             } else {
                 self.cooldown_seconds / 2
             };
@@ -201,7 +213,7 @@ impl KeyPool {
 
             let preview = mask_key(&endpoint.key);
             warn!(
-                "Key {} ({}) placed on {}s cooldown ({})",
+                "Key {} ({}) placed on {}s cooldown ({}, escalation={})",
                 preview,
                 endpoint.provider,
                 cooldown,
@@ -209,9 +221,23 @@ impl KeyPool {
                     "rate limited"
                 } else {
                     "consecutive errors"
-                }
+                },
+                cd_count,
             );
         }
+    }
+
+    /// Returns true if ALL keys in this pool are currently on cooldown.
+    pub async fn all_exhausted(&self) -> bool {
+        if self.endpoints.is_empty() {
+            return true;
+        }
+        for ep in &self.endpoints {
+            if self.is_available(ep).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Get status snapshots of all endpoints for UI display.
@@ -303,6 +329,15 @@ impl KeyPoolManager {
         }
     }
 
+    /// Check if all keys for a given provider are exhausted (on cooldown).
+    pub async fn all_exhausted(&self, provider: &str) -> bool {
+        let pools = self.pools.read().await;
+        match pools.get(provider) {
+            Some(pool) => pool.all_exhausted().await,
+            None => true, // No pool = considered exhausted
+        }
+    }
+
     /// Reload pools from a new profile config.
     pub async fn reload(&self, config: &ProfileConfig) {
         let mut pools = self.pools.write().await;
@@ -356,12 +391,12 @@ impl KeyPoolManager {
     }
 }
 
-/// Mask a key for display: show first 8 chars + "..."
-fn mask_key(key: &str) -> String {
+/// Mask a key for display: show first 3 + "..." + last 3 chars.
+pub fn mask_key(key: &str) -> String {
     if key.len() <= 8 {
         "***".to_string()
     } else {
-        format!("{}...", &key[..8])
+        format!("{}...{}", &key[..3], &key[key.len() - 3..])
     }
 }
 
@@ -441,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mask_key() {
-        assert_eq!(mask_key("sk-or-v1-abcdef123456"), "sk-or-v1...");
+        assert_eq!(mask_key("sk-or-v1-abcdef123456"), "sk-...456");
         assert_eq!(mask_key("short"), "***");
     }
 

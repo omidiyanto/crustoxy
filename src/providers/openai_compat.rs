@@ -101,7 +101,6 @@ impl OpenAICompatProvider {
 
             let _permit = rate_limiter.acquire_concurrency().await;
 
-            let max_retries: u32 = 3;
             let mut last_error: Option<String> = None;
 
             // ── DRY retry loop for tool intent recovery ──────────────────
@@ -123,136 +122,137 @@ impl OpenAICompatProvider {
                 let base_url = get_provider_base_url(&provider_type);
                 let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-                // ── HTTP retry loop (network errors, 429s, 5xx) ──────────
-                for attempt in 0..=max_retries {
-                    rate_limiter.acquire().await;
-
+                // ── 3-tier escalation: key rotation → model fallback → IP rotation ──
+                'key_rotation: loop {
                     let key_ep = key_pool.acquire(&provider_type).await;
                     let api_key = key_ep.as_ref()
                         .map(|ep| ep.key.clone())
                         .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
 
-                    let req = client
-                        .post(&url)
-                        .header("Content-Type", "application/json")
-                        .header("Authorization", format!("Bearer {}", api_key))
-                        .header("Accept", "text/event-stream")
-                        .json(&current_body);
+                    let key_preview = crate::key_pool::mask_key(&api_key);
 
-                    let resp = req.send().await;
+                    if key_ep.is_none() && key_pool.all_exhausted(&provider_type).await {
+                        // All keys for this provider are on cooldown → escalate to model fallback
+                        warn!(
+                            "ALL_KEYS_EXHAUSTED: provider={} → escalating to model fallback",
+                            provider_type
+                        );
+                        break 'key_rotation;
+                    }
 
-                    match resp {
-                        Err(e) => {
-                            if let Some(ep) = &key_ep {
-                                key_pool.report_error(ep, false).await;
-                            }
-                            error!("STREAM_ERROR: request_id={} attempt={} error={}", request_id, attempt, e);
-                            last_error = Some(format!("Connection error: {}", e));
-                            if attempt < max_retries {
-                                let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
-                                warn!("Retrying in {:.1}s (attempt {}/{})", delay, attempt + 1, max_retries);
-                                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                                continue;
-                            }
+                    info!(
+                        "STREAM_ATTEMPT: request_id={} provider={} model={} key={}",
+                        request_id, provider_type, current_body.model, key_preview
+                    );
 
-                            // Fallback on network error
-                            model_router.report_error_by_spec(&resolved_spec).await;
-                            if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
-                                warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
-                                resolved_spec = next_ep.full_spec.clone();
-                                current_body.model = next_ep.model_name.clone();
-                                continue 'tool_retry;
-                            }
-                        }
-                        Ok(response) => {
-                            let status = response.status().as_u16();
+                    // Level 1: same-key retry for 5xx/timeout only
+                    let max_5xx_retries: u32 = 2;
+                    let mut five_xx_attempt: u32 = 0;
 
-                            if status == 429 {
-                                if let Some(ep) = &key_ep {
-                                    key_pool.report_error(ep, true).await;
-                                }
-                                warn!("Rate limited (429): request_id={} attempt={}", request_id, attempt);
+                    loop {
+                        rate_limiter.acquire().await;
 
-                                if attempt < max_retries {
-                                    let delay = (2u64.pow(attempt) * 2) as f64 + rand_jitter();
-                                    warn!("Retrying in {:.1}s (attempt {}/{})", delay, attempt + 1, max_retries);
-                                    rate_limiter.set_blocked(delay).await;
-                                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                                    continue;
-                                }
+                        let req = client
+                            .post(&url)
+                            .header("Content-Type", "application/json")
+                            .header("Authorization", format!("Bearer {}", api_key))
+                            .header("Accept", "text/event-stream")
+                            .json(&current_body);
 
-                                warn!("All retries exhausted. Setting strict block and initiating IP rotation...");
-                                rate_limiter.set_blocked(60.0).await;
+                        let resp = req.send().await;
 
-                                if enable_ip_rotation {
-                                    let rl = rate_limiter.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = ip_rotator::rotate_ip().await {
-                                            error!("IP rotation failed: {}", e);
-                                        } else {
-                                            rl.clear_block().await;
-                                        }
-                                    });
-                                }
-
-                                last_error = Some("Rate limit exceeded. Retries exhausted.".to_string());
-                                // Try model fallback on 429 after retries
-                                model_router.report_error_by_spec(&resolved_spec).await;
-                                if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
-                                    warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
-                                    resolved_spec = next_ep.full_spec.clone();
-                                    current_body.model = next_ep.model_name.clone();
-                                    continue 'tool_retry;
-                                }
-                                break;
-                            }
-
-                            if status >= 400 {
+                        match resp {
+                            Err(e) => {
                                 if let Some(ep) = &key_ep {
                                     key_pool.report_error(ep, false).await;
                                 }
-                                let body_text = response.text().await.unwrap_or_default();
-                                error!("Provider error {}: {}", status, body_text);
-
-                                // Capture payload that triggers unhashable dict error
-                                if status == 500 && body_text.contains("unhashable") {
-                                    error!("Captured unhashable-error payload → failed_payload.json");
-                                    std::fs::write(
-                                        "failed_payload.json",
-                                        serde_json::to_string_pretty(&current_body).unwrap_or_default(),
-                                    ).ok();
-                                }
-
-                                let provider_msg = extract_provider_error(&body_text);
-                                last_error = Some(format!(
-                                    "Provider returned status {} (request_id={}): {}",
-                                    status, request_id, provider_msg
-                                ));
-
-                                if status >= 500 && attempt < max_retries {
-                                    let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
+                                error!(
+                                    "STREAM_CONN_ERROR: request_id={} key={} error={}",
+                                    request_id, key_preview, e
+                                );
+                                last_error = Some(format!("Connection error: {}", e));
+                                if five_xx_attempt < max_5xx_retries {
+                                    five_xx_attempt += 1;
+                                    let delay = (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
+                                    warn!("Retrying same key in {:.1}s ({}/{})", delay, five_xx_attempt, max_5xx_retries);
                                     tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                     continue;
                                 }
+                                // Connection retries exhausted → try next key
+                                continue 'key_rotation;
+                            }
+                            Ok(response) => {
+                                let status = response.status().as_u16();
 
-                                // Model fallback on hard errors
-                                if attempt == max_retries {
-                                    model_router.report_error_by_spec(&resolved_spec).await;
-                                    if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
-                                        warn!("Falling back model from {} to {}", resolved_spec, next_ep.full_spec);
-                                        resolved_spec = next_ep.full_spec.clone();
-                                        current_body.model = next_ep.model_name.clone();
-                                        continue 'tool_retry;
+                                if status == 429 {
+                                    if let Some(ep) = &key_ep {
+                                        key_pool.report_error(ep, true).await;
                                     }
+                                    warn!(
+                                        "RATE_LIMITED: request_id={} provider={} key={} → rotating key",
+                                        request_id, provider_type, key_preview
+                                    );
+                                    last_error = Some(format!("Rate limit (429) on key {}", key_preview));
+                                    // 429 = key-level issue → immediately try next key, NO global block
+                                    continue 'key_rotation;
                                 }
-                                break;
-                            }
 
-                            // ── Successful response: process stream ──────────
-                            model_router.report_success_by_spec(&resolved_spec).await;
-                            if let Some(ep) = &key_ep {
-                                key_pool.report_success(ep, 0).await; // Can pass real latency here later
-                            }
+                                if status >= 500 {
+                                    if let Some(ep) = &key_ep {
+                                        key_pool.report_error(ep, false).await;
+                                    }
+                                    let body_text = response.text().await.unwrap_or_default();
+                                    error!("Provider error {}: {}", status, body_text);
+
+                                    if status == 500 && body_text.contains("unhashable") {
+                                        error!("Captured unhashable-error payload → failed_payload.json");
+                                        std::fs::write(
+                                            "failed_payload.json",
+                                            serde_json::to_string_pretty(&current_body).unwrap_or_default(),
+                                        ).ok();
+                                    }
+
+                                    let provider_msg = extract_provider_error(&body_text);
+                                    last_error = Some(format!(
+                                        "Provider returned status {} (request_id={}): {}",
+                                        status, request_id, provider_msg
+                                    ));
+
+                                    if five_xx_attempt < max_5xx_retries {
+                                        five_xx_attempt += 1;
+                                        let delay = (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
+                                        warn!("5xx retry same key in {:.1}s ({}/{})", delay, five_xx_attempt, max_5xx_retries);
+                                        tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                        continue;
+                                    }
+                                    // 5xx retries exhausted → try next key
+                                    continue 'key_rotation;
+                                }
+
+                                if status >= 400 {
+                                    if let Some(ep) = &key_ep {
+                                        key_pool.report_error(ep, false).await;
+                                    }
+                                    let body_text = response.text().await.unwrap_or_default();
+                                    error!("Provider error {}: {}", status, body_text);
+                                    let provider_msg = extract_provider_error(&body_text);
+                                    last_error = Some(format!(
+                                        "Provider returned status {} (request_id={}): {}",
+                                        status, request_id, provider_msg
+                                    ));
+                                    // 4xx (auth error, bad request) → don't retry, break entirely
+                                    break 'key_rotation;
+                                }
+
+                                // ── Successful response: process stream ──────────
+                                info!(
+                                    "STREAM_OK: request_id={} provider={} model={} key={}",
+                                    request_id, provider_type, current_body.model, key_preview
+                                );
+                                model_router.report_success_by_spec(&resolved_spec).await;
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_success(ep, 0).await;
+                                }
                             let mut think_parser = ThinkTagParser::new();
                             let mut heuristic_parser = HeuristicToolParser::new();
                             let mut finish_reason: Option<String> = None;
@@ -583,11 +583,44 @@ impl OpenAICompatProvider {
                             yield sse.message_delta(stop, output_tokens);
                             yield sse.message_stop();
                             return;
-                        }
+                                } // end Ok(response) =>
+                            } // end match resp
+                        } // end inner 5xx retry loop
+                    } // end 'key_rotation
+
+                // ── Model fallback: all keys for current provider exhausted ──
+                model_router.report_error_by_spec(&resolved_spec).await;
+                if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved_spec).await {
+                    warn!(
+                        "MODEL_FALLBACK: {} → {} (all keys for {} exhausted)",
+                        resolved_spec, next_ep.full_spec,
+                        Settings::parse_provider_type(&resolved_spec),
+                    );
+                    resolved_spec = next_ep.full_spec.clone();
+                    current_body.model = next_ep.model_name.clone();
+                    continue 'tool_retry;
+                }
+
+                // ── IP rotation: absolute last resort ──
+                // Only trigger when ALL models AND all keys are exhausted
+                if enable_ip_rotation {
+                    let current_provider = Settings::parse_provider_type(&resolved_spec).to_string();
+                    if key_pool.all_exhausted(&current_provider).await {
+                        warn!(
+                            "IP_ROTATION: ALL models and ALL keys exhausted → rotating WARP IP as last resort"
+                        );
+                        rate_limiter.set_blocked(30.0).await;
+                        let rl = rate_limiter.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = ip_rotator::rotate_ip().await {
+                                error!("IP rotation failed: {}", e);
+                            } else {
+                                rl.clear_block().await;
+                            }
+                        });
                     }
                 }
 
-                // If we reached here from error path, break the tool retry loop too
                 break 'tool_retry;
             }
 
@@ -621,11 +654,11 @@ impl OpenAICompatProvider {
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
-        let max_retries: u32 = 2;
         let _permit = self.rate_limiter.acquire_concurrency().await;
+        let mut last_error = String::new();
 
         // Model fallback loop
-        loop {
+        'model_fallback: loop {
             let provider_type = Settings::parse_provider_type(&resolved).to_string();
             let model_name = Settings::parse_model_name(&resolved).to_string();
             let base_url = get_provider_base_url(&provider_type);
@@ -636,203 +669,241 @@ impl OpenAICompatProvider {
 
             let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-            info!(
-                "NON_STREAM: request_id={} provider={} model={}",
-                request_id, provider_type, model_name,
-            );
-
-            let mut last_error = String::new();
-            let mut retries_exhausted = false;
-
-            // HTTP retry loop
-            for attempt in 0..=max_retries {
-                self.rate_limiter.acquire().await;
-
+            // ── Key rotation loop ──
+            'key_rotation: loop {
                 let key_ep = key_pool.acquire(&provider_type).await;
                 let api_key = key_ep
                     .as_ref()
                     .map(|ep| ep.key.clone())
                     .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
 
-                let resp = self
-                    .client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .json(&body)
-                    .send()
-                    .await;
+                let key_preview = crate::key_pool::mask_key(&api_key);
 
-                match resp {
-                    Err(e) => {
-                        if let Some(ep) = &key_ep {
-                            key_pool.report_error(ep, false).await;
-                        }
-                        last_error = format!("Connection error: {}", e);
-                        if attempt < max_retries {
-                            let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
-                            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                            continue;
-                        }
-                        retries_exhausted = true;
-                    }
-                    Ok(response) => {
-                        let status = response.status().as_u16();
+                if key_ep.is_none() && key_pool.all_exhausted(&provider_type).await {
+                    warn!(
+                        "ALL_KEYS_EXHAUSTED: provider={} → escalating to model fallback",
+                        provider_type
+                    );
+                    break 'key_rotation;
+                }
 
-                        if status == 429 {
-                            if let Some(ep) = &key_ep {
-                                key_pool.report_error(ep, true).await;
-                            }
-                            last_error = "Rate limit exceeded".to_string();
-                            if attempt < max_retries {
-                                let delay = (2u64.pow(attempt) * 2) as f64 + rand_jitter();
-                                self.rate_limiter.set_blocked(delay).await;
-                                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
-                                continue;
-                            }
-                            retries_exhausted = true;
-                            break;
-                        }
+                info!(
+                    "NON_STREAM_ATTEMPT: request_id={} provider={} model={} key={}",
+                    request_id, provider_type, model_name, key_preview
+                );
 
-                        if status >= 400 {
+                // Level 1: same-key retry for 5xx/timeout only
+                let max_5xx_retries: u32 = 2;
+                let mut five_xx_attempt: u32 = 0;
+
+                loop {
+                    self.rate_limiter.acquire().await;
+
+                    let resp = self
+                        .client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", format!("Bearer {}", api_key))
+                        .json(&body)
+                        .send()
+                        .await;
+
+                    match resp {
+                        Err(e) => {
                             if let Some(ep) = &key_ep {
                                 key_pool.report_error(ep, false).await;
                             }
-                            let body_text = response.text().await.unwrap_or_default();
-                            let msg = extract_provider_error(&body_text);
-                            last_error = format!("Provider returned status {}: {}", status, msg);
-                            if status >= 500 && attempt < max_retries {
-                                let delay = (2u64.pow(attempt)) as f64 + rand_jitter();
+                            last_error = format!("Connection error: {}", e);
+                            if five_xx_attempt < max_5xx_retries {
+                                five_xx_attempt += 1;
+                                let delay = (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
                                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                 continue;
                             }
-                            retries_exhausted = true;
-                            break;
+                            continue 'key_rotation;
                         }
+                        Ok(response) => {
+                            let status = response.status().as_u16();
 
-                        // ── Success: parse response ──
-                        model_router.report_success_by_spec(&resolved).await;
-                        if let Some(ep) = &key_ep {
-                            key_pool.report_success(ep, 0).await;
-                        }
-
-                        let resp_body: Value = response
-                            .json()
-                            .await
-                            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-                        // Convert OpenAI ChatCompletion → Anthropic MessagesResponse
-                        let message_id = format!("msg_{}", Uuid::new_v4());
-                        let choice = resp_body
-                            .get("choices")
-                            .and_then(|c| c.get(0))
-                            .ok_or("No choices in response")?;
-
-                        let message = choice.get("message").ok_or("No message in choice")?;
-                        let finish = choice
-                            .get("finish_reason")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("stop");
-
-                        let mut content_blocks: Vec<Value> = Vec::new();
-
-                        // Text content
-                        if let Some(text) = message.get("content").and_then(|v| v.as_str())
-                            && !text.is_empty()
-                        {
-                            content_blocks.push(json!({"type": "text", "text": text}));
-                        }
-
-                        // Reasoning content
-                        let reasoning_val = message
-                            .get("reasoning_content")
-                            .or_else(|| message.get("reasoning"));
-                        if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
-                            && !reasoning.is_empty()
-                        {
-                            content_blocks.push(json!({"type": "thinking", "thinking": reasoning}));
-                        }
-
-                        // Tool calls
-                        if let Some(tool_calls) =
-                            message.get("tool_calls").and_then(|v| v.as_array())
-                        {
-                            for tc in tool_calls {
-                                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let args_str = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("arguments"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("{}");
-                                let input: Value = match serde_json::from_str(args_str) {
-                                    Ok(val) => val,
-                                    Err(_) => {
-                                        let garbled = format!(
-                                            r#"{{"name": "{}", "arguments": {}}}"#,
-                                            name, args_str
-                                        );
-                                        crate::heuristic_tool_parser::recover_garbled_tool_json(
-                                            &garbled,
-                                        )
-                                        .map(|rec| serde_json::Value::Object(rec.arguments))
-                                        .unwrap_or_else(|| json!({}))
-                                    }
-                                };
-                                content_blocks.push(json!({
-                                    "type": "tool_use",
-                                    "id": id,
-                                    "name": name,
-                                    "input": input
-                                }));
+                            if status == 429 {
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_error(ep, true).await;
+                                }
+                                warn!(
+                                    "RATE_LIMITED: request_id={} provider={} key={} → rotating key",
+                                    request_id, provider_type, key_preview
+                                );
+                                last_error = format!("Rate limit (429) on key {}", key_preview);
+                                continue 'key_rotation;
                             }
-                        }
 
-                        if content_blocks.is_empty() {
-                            content_blocks.push(json!({"type": "text", "text": " "}));
-                        }
-
-                        let usage = resp_body.get("usage");
-                        let output_tokens = usage
-                            .and_then(|u| u.get("completion_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(1) as u32;
-
-                        let stop_reason = map_stop_reason(Some(finish));
-
-                        return Ok(json!({
-                            "id": message_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "model": request.model,
-                            "content": content_blocks,
-                            "stop_reason": stop_reason,
-                            "stop_sequence": null,
-                            "usage": {
-                                "input_tokens": input_tokens,
-                                "output_tokens": output_tokens,
-                                "cache_creation_input_tokens": 0,
-                                "cache_read_input_tokens": 0
+                            if status >= 500 {
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_error(ep, false).await;
+                                }
+                                let body_text = response.text().await.unwrap_or_default();
+                                let msg = extract_provider_error(&body_text);
+                                last_error =
+                                    format!("Provider returned status {}: {}", status, msg);
+                                if five_xx_attempt < max_5xx_retries {
+                                    five_xx_attempt += 1;
+                                    let delay =
+                                        (2u64.pow(five_xx_attempt - 1)) as f64 + rand_jitter();
+                                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                                    continue;
+                                }
+                                continue 'key_rotation;
                             }
-                        }));
+
+                            if status >= 400 {
+                                if let Some(ep) = &key_ep {
+                                    key_pool.report_error(ep, false).await;
+                                }
+                                let body_text = response.text().await.unwrap_or_default();
+                                let msg = extract_provider_error(&body_text);
+                                last_error =
+                                    format!("Provider returned status {}: {}", status, msg);
+                                return Err(last_error);
+                            }
+
+                            // ── Success ──
+                            info!(
+                                "NON_STREAM_OK: request_id={} provider={} model={} key={}",
+                                request_id, provider_type, model_name, key_preview
+                            );
+                            model_router.report_success_by_spec(&resolved).await;
+                            if let Some(ep) = &key_ep {
+                                key_pool.report_success(ep, 0).await;
+                            }
+
+                            let resp_body: Value = response
+                                .json()
+                                .await
+                                .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+                            let message_id = format!("msg_{}", Uuid::new_v4());
+                            let choice = resp_body
+                                .get("choices")
+                                .and_then(|c| c.get(0))
+                                .ok_or("No choices in response")?;
+
+                            let message = choice.get("message").ok_or("No message in choice")?;
+                            let finish = choice
+                                .get("finish_reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("stop");
+
+                            let mut content_blocks: Vec<Value> = Vec::new();
+
+                            if let Some(text) = message.get("content").and_then(|v| v.as_str())
+                                && !text.is_empty()
+                            {
+                                content_blocks.push(json!({"type": "text", "text": text}));
+                            }
+
+                            let reasoning_val = message
+                                .get("reasoning_content")
+                                .or_else(|| message.get("reasoning"));
+                            if let Some(reasoning) = reasoning_val.and_then(|v| v.as_str())
+                                && !reasoning.is_empty()
+                            {
+                                content_blocks
+                                    .push(json!({"type": "thinking", "thinking": reasoning}));
+                            }
+
+                            if let Some(tool_calls) =
+                                message.get("tool_calls").and_then(|v| v.as_array())
+                            {
+                                for tc in tool_calls {
+                                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("name"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let args_str = tc
+                                        .get("function")
+                                        .and_then(|f| f.get("arguments"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("{}");
+                                    let input: Value = match serde_json::from_str(args_str) {
+                                        Ok(val) => val,
+                                        Err(_) => {
+                                            let garbled = format!(
+                                                r#"{{"name": "{}", "arguments": {}}}"#,
+                                                name, args_str
+                                            );
+                                            crate::heuristic_tool_parser::recover_garbled_tool_json(
+                                                &garbled,
+                                            )
+                                            .map(|rec| serde_json::Value::Object(rec.arguments))
+                                            .unwrap_or_else(|| json!({}))
+                                        }
+                                    };
+                                    content_blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+                                }
+                            }
+
+                            if content_blocks.is_empty() {
+                                content_blocks.push(json!({"type": "text", "text": " "}));
+                            }
+
+                            let usage = resp_body.get("usage");
+                            let output_tokens = usage
+                                .and_then(|u| u.get("completion_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(1)
+                                as u32;
+
+                            let stop_reason = map_stop_reason(Some(finish));
+
+                            return Ok(json!({
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "model": request.model,
+                                "content": content_blocks,
+                                "stop_reason": stop_reason,
+                                "stop_sequence": null,
+                                "usage": {
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": output_tokens,
+                                    "cache_creation_input_tokens": 0,
+                                    "cache_read_input_tokens": 0
+                                }
+                            }));
+                        }
                     }
-                }
+                } // end inner 5xx retry
+            } // end 'key_rotation
+
+            // ── Model fallback ──
+            model_router.report_error_by_spec(&resolved).await;
+            if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved).await {
+                warn!(
+                    "MODEL_FALLBACK: {} → {} (all keys for {} exhausted)",
+                    resolved,
+                    next_ep.full_spec,
+                    Settings::parse_provider_type(&resolved),
+                );
+                resolved = next_ep.full_spec.clone();
+                continue 'model_fallback;
             }
 
-            // Retries exhausted — try model fallback
-            if retries_exhausted {
-                model_router.report_error_by_spec(&resolved).await;
-                if let Some(next_ep) = model_router.next_fallback(&request_model, &resolved).await {
-                    warn!(
-                        "Non-streaming fallback from {} to {}",
-                        resolved, next_ep.full_spec
-                    );
-                    resolved = next_ep.full_spec.clone();
-                    continue;
+            // ── IP rotation: absolute last resort ──
+            if self.enable_ip_rotation {
+                let current_provider = Settings::parse_provider_type(&resolved).to_string();
+                if key_pool.all_exhausted(&current_provider).await {
+                    warn!("IP_ROTATION: ALL models and ALL keys exhausted → rotating WARP IP");
+                    self.rate_limiter.set_blocked(30.0).await;
+                    let rl = self.rate_limiter.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = ip_rotator::rotate_ip().await {
+                            error!("IP rotation failed: {}", e);
+                        } else {
+                            rl.clear_block().await;
+                        }
+                    });
                 }
             }
 
