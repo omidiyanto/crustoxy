@@ -66,6 +66,7 @@ impl CloudflareProvider {
             .unwrap_or_else(|| request.model.clone());
 
         let request_model = request.model.clone();
+        let original_request = request.clone(); // Keep full request for body rebuilds on fallback
         let request_id = request_id.to_string();
         let rate_limiter = self.rate_limiter.clone();
         let client = self.client.clone();
@@ -570,7 +571,13 @@ impl CloudflareProvider {
                         Settings::parse_provider_type(&resolved_spec),
                     );
                     resolved_spec = next_ep.full_spec.clone();
-                    current_body.model = next_ep.model_name.clone();
+                    // Fully rebuild the request body for the new provider type.
+                    // This ensures correct schema sanitization and stream_options.
+                    current_body = build_openai_request(
+                        &original_request,
+                        &next_ep.model_name,
+                        Settings::parse_provider_type(&next_ep.full_spec),
+                    );
                     continue 'tool_retry;
                 }
 
