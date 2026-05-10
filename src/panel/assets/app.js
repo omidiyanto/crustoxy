@@ -480,8 +480,10 @@
       html += `<tr><td colspan="5" style="text-align:center; color:var(--text-disabled)">[NO KEYS CONFIGURED]</td></tr>`;
     } else {
       keysArray.forEach((fullKey, idx) => {
-        // Match status using the first 8 chars preview format Crustoxy uses internally
-        const masked = fullKey.substring(0, 8) + (fullKey.length > 8 ? "..." : "");
+        // Match backend mask_key(): first 3 + "..." + last 3 chars (or "***" for short keys)
+        const masked = fullKey.length > 8
+          ? fullKey.substring(0, 3) + "..." + fullKey.substring(fullKey.length - 3)
+          : "***";
         const kStats = provStatus.find(s => s.key_preview === masked) || { healthy: false, on_cooldown: false, total_requests: 0, total_errors: 0, _unknown: true };
 
         let statLabel = "UNKNOWN";
@@ -898,14 +900,16 @@
       await loadAll();
     });
 
-    // Auto-refresh status every 30s
+    // Auto-refresh status every 10s
     setInterval(async () => {
       try {
         status = await api("GET", "/status");
         updateStatusIndicator();
-        if (currentPage === "dashboard") renderPage("dashboard");
+        if (currentPage === "dashboard" || currentPage === "providers") {
+          renderPage(currentPage);
+        }
       } catch { /* ignore */ }
-    }, 30000);
+    }, 10000);
   }
 
   document.addEventListener("DOMContentLoaded", init);
