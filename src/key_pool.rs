@@ -83,6 +83,20 @@ impl KeyPool {
 
     /// Select the next healthy key using the configured strategy.
     /// Returns `None` if all keys are on cooldown.
+    ///
+    /// **Concurrency note**: this method does **not** reserve the chosen key
+    /// for the duration of the in-flight request. With many concurrent
+    /// requests targeting a pool that has only a single healthy key, multiple
+    /// callers will pick the same endpoint and may all hit a 429 in lock-step
+    /// before any of them reports an error. This is mitigated by:
+    ///
+    /// 1. The provider-level `RateLimiter::acquire_concurrency()` semaphore
+    ///    that throttles the global parallel request count.
+    /// 2. Round-robin distribution across multiple keys when more than one is
+    ///    healthy.
+    ///
+    /// For pools with a single key under bursty load, prefer increasing the
+    /// number of keys or lowering `max_concurrency` in routing config.
     pub async fn acquire(&self) -> Option<Arc<KeyEndpoint>> {
         if self.endpoints.is_empty() {
             return None;
@@ -389,16 +403,23 @@ impl KeyPoolManager {
     }
 
     /// Spawn a background recovery task that periodically clears expired cooldowns.
+    ///
+    /// The first sleep uses `initial_interval_secs`, but every subsequent
+    /// iteration re-reads `routing_config.health_recovery_interval`, so config
+    /// reloads (UI / hot-swap) take effect at the next tick without needing a
+    /// task restart.
     pub fn spawn_recovery_task(
         self: &Arc<Self>,
-        interval_secs: u64,
+        initial_interval_secs: u64,
     ) -> tokio::task::JoinHandle<()> {
         let manager = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            let mut current_interval = initial_interval_secs.max(1);
             loop {
-                interval.tick().await;
+                tokio::time::sleep(std::time::Duration::from_secs(current_interval)).await;
                 manager.recover_all().await;
+                let cfg = manager.routing_config.read().await;
+                current_interval = cfg.health_recovery_interval.max(1);
             }
         })
     }

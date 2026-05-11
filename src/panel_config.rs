@@ -314,20 +314,44 @@ impl ProfileConfig {
 }
 
 impl PanelConfig {
-    /// Get the currently active profile.
-    pub fn active_profile(&self) -> &ProfileConfig {
+    /// Get the currently active profile, returning `None` if no profiles exist.
+    /// Prefer this over [`active_profile`] when the caller can handle a missing
+    /// profile gracefully (e.g. read-only paths that may be reached before
+    /// validation).
+    pub fn try_active_profile(&self) -> Option<&ProfileConfig> {
         self.profiles
             .get(&self.general.active_profile)
             .or_else(|| self.profiles.values().next())
-            .expect("config must have at least one profile")
     }
 
-    /// Get a mutable reference to the active profile.
-    pub fn active_profile_mut(&mut self) -> &mut ProfileConfig {
+    /// Get a mutable reference to the active profile, returning `None` if no
+    /// profiles exist. Self-heals `general.active_profile` when its key no
+    /// longer points to an existing profile.
+    pub fn try_active_profile_mut(&mut self) -> Option<&mut ProfileConfig> {
+        if !self.profiles.contains_key(&self.general.active_profile)
+            && let Some(first_key) = self.profiles.keys().next().cloned()
+        {
+            self.general.active_profile = first_key;
+        }
         let key = self.general.active_profile.clone();
-        self.profiles
-            .get_mut(&key)
-            .expect("config must have at least one profile")
+        self.profiles.get_mut(&key)
+    }
+
+    /// Get the currently active profile.
+    ///
+    /// `validate()` enforces `!profiles.is_empty()` at every entry point, so
+    /// in practice this never panics. The fallback to the first profile keeps
+    /// us safe when `general.active_profile` drifts from the actual map keys.
+    pub fn active_profile(&self) -> &ProfileConfig {
+        self.try_active_profile()
+            .expect("PanelConfig has no profiles — Config::validate() should have prevented this")
+    }
+
+    /// Get a mutable reference to the active profile. See [`active_profile`]
+    /// for invariants. Self-heals `general.active_profile` when stale.
+    pub fn active_profile_mut(&mut self) -> &mut ProfileConfig {
+        self.try_active_profile_mut()
+            .expect("PanelConfig has no profiles — Config::validate() should have prevented this")
     }
 
     /// Load configuration from a TOML file.

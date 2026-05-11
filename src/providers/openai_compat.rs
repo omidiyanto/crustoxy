@@ -9,7 +9,7 @@ use tokio_stream::Stream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::config::{Settings, get_provider_default_base_url};
+use crate::config::{Settings, resolve_provider_base_url};
 use crate::converter::{build_openai_request, map_stop_reason};
 use crate::heuristic_tool_parser::HeuristicToolParser;
 use crate::ip_rotator;
@@ -121,7 +121,7 @@ impl OpenAICompatProvider {
 
             'tool_retry: while tool_attempt < max_tool_attempts {
                 let provider_type = Settings::parse_provider_type(&resolved_spec).to_string();
-                let base_url = provider_base_url_from(&provider_base_urls, &provider_type);
+                let base_url = resolve_provider_base_url(&provider_base_urls, &provider_type);
                 let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
                 // ── 3-tier escalation: key rotation → model fallback → IP rotation ──
@@ -713,7 +713,7 @@ impl OpenAICompatProvider {
         'model_fallback: loop {
             let provider_type = Settings::parse_provider_type(&resolved).to_string();
             let model_name = Settings::parse_model_name(&resolved).to_string();
-            let base_url = provider_base_url_from(&self.provider_base_urls, &provider_type);
+            let base_url = resolve_provider_base_url(&self.provider_base_urls, &provider_type);
 
             let mut body = build_openai_request(request, &model_name, &provider_type);
             body.stream = false;
@@ -1036,13 +1036,4 @@ fn rand_jitter() -> f64 {
         .bytes()
         .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     (nanos.wrapping_add(tid_hash) % 1000) as f64 / 1000.0
-}
-
-fn provider_base_url_from(overrides: &HashMap<String, String>, provider_name: &str) -> String {
-    overrides
-        .get(provider_name)
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| get_provider_default_base_url(provider_name))
 }

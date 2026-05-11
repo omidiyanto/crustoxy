@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
 
+use crate::auth::constant_time_eq;
 use crate::config::{PROVIDERS, Settings};
 use crate::panel_config::{PanelConfig, ProfileConfig};
 use crate::routes::AppState;
@@ -32,7 +33,7 @@ fn check_panel_auth(headers: &HeaderMap, state: &AppState) -> Result<(), Respons
         .or_else(|| headers.get("x-panel-token").and_then(|v| v.to_str().ok()));
 
     match provided {
-        Some(t) if t == token.as_str() => Ok(()),
+        Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => Ok(()),
         _ => Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "Authentication required"})),
@@ -54,7 +55,7 @@ pub async fn authenticate(
     let settings = state.settings.load();
     let expected = settings.anthropic_auth_token.as_deref().unwrap_or("");
 
-    if expected.is_empty() || body.token == expected {
+    if expected.is_empty() || constant_time_eq(body.token.as_bytes(), expected.as_bytes()) {
         Json(json!({"authenticated": true})).into_response()
     } else {
         (

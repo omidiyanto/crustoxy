@@ -260,38 +260,183 @@
     renderModelHealth($("#dash-models"));
   }
 
+  // Status legend used by both visualizations.
+  const HV_LEGEND = `
+    <div class="hv-legend">
+      <span class="hv-legend-item"><span class="hv-legend-dot healthy"></span>Healthy</span>
+      <span class="hv-legend-item"><span class="hv-legend-dot cooldown"></span>Cooldown</span>
+      <span class="hv-legend-item"><span class="hv-legend-dot down"></span>Down</span>
+    </div>
+  `;
+
+  function keyStatus(k) {
+    if (k.on_cooldown) return "cooldown";
+    if (k.healthy) return "healthy";
+    return "down";
+  }
+
+  function buildDonut(healthy, cooldown, down) {
+    const total = Math.max(healthy + cooldown + down, 1);
+    const r = 36; // radius
+    const c = 2 * Math.PI * r; // circumference
+    const seg = (n) => (n / total) * c;
+    const sHealthy = seg(healthy);
+    const sCool = seg(cooldown);
+    const sDown = seg(down);
+    // Each arc uses dasharray="thisSeg total-thisSeg" with cumulative offset
+    let offset = 0;
+    const arc = (len, color) => {
+      const part = `<circle cx="44" cy="44" r="${r}" class="kp-donut-arc"
+          style="stroke:${color}; stroke-dasharray:${len.toFixed(2)} ${(c - len).toFixed(2)}; stroke-dashoffset:${(-offset).toFixed(2)}" />`;
+      offset += len;
+      return part;
+    };
+    const totalKeys = healthy + cooldown + down;
+    return `
+      <div class="kp-donut-wrap">
+        <svg class="kp-donut" viewBox="0 0 88 88">
+          <circle cx="44" cy="44" r="${r}" class="kp-donut-track"></circle>
+          ${healthy ? arc(sHealthy, "var(--hv-healthy)") : ""}
+          ${cooldown ? arc(sCool, "var(--hv-cooldown)") : ""}
+          ${down ? arc(sDown, "var(--hv-down)") : ""}
+        </svg>
+        <div class="kp-donut-label">
+          <div class="kp-donut-value">${healthy}/${totalKeys || 0}</div>
+          <div class="kp-donut-unit">Live</div>
+        </div>
+      </div>
+    `;
+  }
+
   function renderKeyHealth(el) {
-    if (!status || !status.key_pools) {
-      el.innerHTML = '<div class="empty-state"><div class="empty-state-text">[NO KEY DATA]</div></div>';
+    if (!status || !status.key_pools || !Object.keys(status.key_pools).length) {
+      el.innerHTML = '<div class="empty-state"><div class="empty-state-text">[NO KEYS CONFIGURED]</div></div>';
       return;
     }
-    let html = '<div class="table-wrap"><table><tr><th>Provider</th><th>Key</th><th>Status</th><th>Requests</th><th>Errors</th></tr>';
+
+    const cards = [];
+    let cardIdx = 0;
     for (const [prov, keys] of Object.entries(status.key_pools)) {
+      let healthy = 0, cool = 0, down = 0;
+      let totalReq = 0, totalErr = 0;
       for (const k of keys) {
-        const cls = k.on_cooldown ? "cooldown" : k.healthy ? "healthy" : "unhealthy";
-        const label = k.on_cooldown ? "COOLDOWN" : k.healthy ? "HEALTHY" : "DOWN";
-        html += `<tr><td>${escapeHtml(prov)}</td><td>${escapeHtml(k.key_preview)}</td><td><span class="status-dot ${cls}"></span>${label}</td><td>${safeNumber(k.total_requests)}</td><td>${safeNumber(k.total_errors)}</td></tr>`;
+        if (k.on_cooldown) cool++;
+        else if (k.healthy) healthy++;
+        else down++;
+        totalReq += safeNumber(k.total_requests);
+        totalErr += safeNumber(k.total_errors);
       }
+      const totalKeys = keys.length;
+      const ratio = totalKeys ? healthy / totalKeys : 0;
+      const state = totalKeys === 0
+        ? "empty"
+        : down === totalKeys
+        ? "down"
+        : cool + down > 0
+        ? "degraded"
+        : "ok";
+
+      const maxReq = keys.reduce((m, k) => Math.max(m, safeNumber(k.total_requests)), 1);
+
+      const keysHtml = keys.map((k, i) => {
+        const stat = keyStatus(k);
+        const reqs = safeNumber(k.total_requests);
+        const errs = safeNumber(k.total_errors);
+        const fill = Math.min(reqs / maxReq, 1) || 0;
+        return `
+          <div class="kp-key" data-status="${stat}" style="--kp-key-index:${i}">
+            <span class="kp-key-pulse"></span>
+            <span class="kp-key-id" title="${escapeAttr(k.key_preview)}">${escapeHtml(k.key_preview)}</span>
+            <span class="kp-key-meter"><span class="kp-key-meter-fill" style="--hv-fill:${fill.toFixed(3)};"></span></span>
+            <span class="kp-key-counts">${reqs}r${errs > 0 ? ` · <span class="err">${errs}e</span>` : ""}</span>
+          </div>`;
+      }).join("");
+
+      const avgLatency = (() => {
+        const valid = keys.map((k) => safeNumber(k.last_latency_ms)).filter((v) => v > 0);
+        if (!valid.length) return null;
+        return Math.round(valid.reduce((a, b) => a + b, 0) / valid.length);
+      })();
+
+      cards.push(`
+        <div class="kp-card" data-state="${state}" style="--kp-health-ratio:${ratio.toFixed(3)}; animation-delay:${cardIdx * 60}ms">
+          <div class="kp-card-top">
+            <div class="kp-meta">
+              <div class="kp-provider">${escapeHtml(prov)}</div>
+              <div class="kp-headline">
+                <span>${healthy}</span><span class="kp-headline-divider">/</span><span class="kp-headline-total">${totalKeys}</span>
+              </div>
+              <div class="kp-sub">${totalReq} reqs · ${totalErr} errs${avgLatency !== null ? ` · ${avgLatency}ms avg` : ""}</div>
+            </div>
+            ${buildDonut(healthy, cool, down)}
+          </div>
+          <div class="kp-keys">${keysHtml}</div>
+        </div>
+      `);
+      cardIdx++;
     }
-    html += "</table></div>";
-    el.innerHTML = Object.keys(status.key_pools).length ? html : '<div class="empty-state"><div class="empty-state-text">[NO KEYS CONFIGURED]</div></div>';
+
+    el.innerHTML = `${HV_LEGEND}<div class="kp-grid">${cards.join("")}</div>`;
   }
 
   function renderModelHealth(el) {
-    if (!status || !status.model_router) {
-      el.innerHTML = '<div class="empty-state"><div class="empty-state-text">[NO MODEL DATA]</div></div>';
+    if (!status || !status.model_router || !Object.keys(status.model_router).length) {
+      el.innerHTML = '<div class="empty-state"><div class="empty-state-text">[NO MODELS CONFIGURED]</div></div>';
       return;
     }
-    let html = '<div class="table-wrap"><table><tr><th>Tier</th><th>Provider</th><th>Model</th><th>Status</th></tr>';
-    for (const [tier, models] of Object.entries(status.model_router)) {
+
+    // Stable tier ordering: opus → sonnet → haiku → default → others alphabetical
+    const tierOrder = ["opus", "sonnet", "haiku", "default"];
+    const entries = Object.entries(status.model_router).sort(([a], [b]) => {
+      const ai = tierOrder.indexOf(a);
+      const bi = tierOrder.indexOf(b);
+      if (ai === -1 && bi === -1) return a.localeCompare(b);
+      if (ai === -1) return 1;
+      if (bi === -1) return -1;
+      return ai - bi;
+    });
+
+    const cards = entries.map(([tier, models], idx) => {
+      let healthy = 0, cool = 0, down = 0;
       for (const m of models) {
-        const cls = m.on_cooldown ? "cooldown" : m.healthy ? "healthy" : "unhealthy";
-        const label = m.on_cooldown ? "COOLDOWN" : m.healthy ? "READY" : "DOWN";
-        html += `<tr><td style="text-transform:uppercase">${escapeHtml(tier)}</td><td>${escapeHtml(m.provider)}</td><td>${escapeHtml(m.model_name)}</td><td><span class="status-dot ${cls}"></span>${label}</td></tr>`;
+        if (m.on_cooldown) cool++;
+        else if (m.healthy) healthy++;
+        else down++;
       }
-    }
-    html += "</table></div>";
-    el.innerHTML = Object.keys(status.model_router).length ? html : '<div class="empty-state"><div class="empty-state-text">[NO MODELS CONFIGURED]</div></div>';
+      const total = models.length;
+      const ratio = total ? healthy / total : 0;
+      const state = total === 0
+        ? "empty"
+        : down === total
+        ? "down"
+        : cool + down > 0
+        ? "degraded"
+        : "ok";
+
+      const modelsHtml = models.map((m, i) => {
+        const stat = m.on_cooldown ? "cooldown" : m.healthy ? "healthy" : "down";
+        const label = stat === "healthy" ? "Ready" : stat === "cooldown" ? "Cooldown" : "Down";
+        return `
+          <div class="mr-model" data-status="${stat}" style="--mr-model-index:${i}">
+            <span class="mr-model-provider" title="${escapeAttr(m.provider)}">${escapeHtml(m.provider)}</span>
+            <span class="mr-model-name" title="${escapeAttr(m.model_name)}">${escapeHtml(m.model_name)}</span>
+            <span class="mr-model-pulse"><span class="mr-model-pulse-dot"></span>${label}</span>
+          </div>`;
+      }).join("");
+
+      return `
+        <div class="mr-tier" data-tier="${escapeAttr(tier)}" data-state="${state}" style="animation-delay:${idx * 80}ms">
+          <div class="mr-tier-header">
+            <span class="mr-tier-badge">${escapeHtml(tier)}</span>
+            <span class="mr-tier-count"><span>${healthy}</span><span class="total"> / ${total}</span></span>
+          </div>
+          <div class="mr-tier-bar"><div class="mr-tier-bar-fill" style="--hv-fill:${ratio.toFixed(3)}"></div></div>
+          <div class="mr-models">${modelsHtml}</div>
+        </div>
+      `;
+    });
+
+    el.innerHTML = `${HV_LEGEND}<div class="mr-grid">${cards.join("")}</div>`;
   }
 
   // ── Models Page ──────────────────────────────────────────────────────────

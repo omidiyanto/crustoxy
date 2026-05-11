@@ -108,17 +108,32 @@ pub async fn rotate_ip() -> Result<(), String> {
 }
 
 /// Sync WARP connection state based on the provided flag.
+///
+/// Failures are logged at WARN level (instead of being silently swallowed) so
+/// operators running in non-WARP containers can see why IP rotation isn't
+/// taking effect.
 pub async fn sync_warp_state(enabled: bool) {
     let lock = get_lock();
     let _guard = lock.lock().await;
 
     if enabled {
         info!("Enabling WARP connection...");
-        let _ = run_cmd("warp-cli", &["--accept-tos", "registration", "new"]).await;
-        let _ = run_cmd("warp-cli", &["--accept-tos", "connect"]).await;
+        if let Err(e) = run_cmd("warp-cli", &["--accept-tos", "registration", "new"]).await {
+            warn!(
+                "WARP registration failed (warp-cli unavailable or already registered?): {}",
+                e
+            );
+        }
+        if let Err(e) = run_cmd("warp-cli", &["--accept-tos", "connect"]).await {
+            warn!("WARP connect failed: {}", e);
+        }
     } else {
         info!("Disabling WARP connection...");
-        let _ = run_cmd("warp-cli", &["--accept-tos", "disconnect"]).await;
-        let _ = run_cmd("warp-cli", &["--accept-tos", "registration", "delete"]).await;
+        if let Err(e) = run_cmd("warp-cli", &["--accept-tos", "disconnect"]).await {
+            warn!("WARP disconnect failed: {}", e);
+        }
+        if let Err(e) = run_cmd("warp-cli", &["--accept-tos", "registration", "delete"]).await {
+            warn!("WARP registration delete failed: {}", e);
+        }
     }
 }

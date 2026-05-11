@@ -313,3 +313,17 @@ pub fn get_provider_default_base_url(provider_name: &str) -> String {
         .map(|d| d.default_base_url.to_string())
         .unwrap_or_default()
 }
+
+/// Resolve a provider's base URL from an override map (config) with a fallback
+/// to the static default list. Shared helper used by provider implementations.
+pub fn resolve_provider_base_url(
+    overrides: &HashMap<String, String>,
+    provider_name: &str,
+) -> String {
+    overrides
+        .get(provider_name)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| get_provider_default_base_url(provider_name))
+}
