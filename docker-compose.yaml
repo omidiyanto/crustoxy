@@ -1,17 +1,37 @@
+x-crustoxy-base: &crustoxy-base
+  # build: .
+  image: ghcr.io/omidiyanto/crustoxy:latest
+  restart: unless-stopped
+  ports:
+    - "${CRUSTOXY_LISTEN_ADDR:-127.0.0.1}:${PORT:-8082}:${PORT:-8082}"
+  env_file:
+    - .env
+  environment: &crustoxy-env
+    HOST: 0.0.0.0
+    PORT: ${PORT:-8082}
+    ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:?Set ANTHROPIC_AUTH_TOKEN in .env before starting Docker deployments}
+  volumes:
+    - ./data:/root/.config/crustoxy
+
 services:
   crustoxy:
-    # build: .
-    image: ghcr.io/omidiyanto/crustoxy:latest
+    <<: *crustoxy-base
     container_name: crustoxy
-    restart: unless-stopped
-    ports:
-      - "8082:8082"
-    env_file:
-      - .env
-    volumes:
-      - ./data:/root/.config/crustoxy
-    # Note: NET_ADMIN capability and /dev/net/tun device are required 
-    # for Cloudflare WARP to properly establish a connection inside the container.
+    environment:
+      <<: *crustoxy-env
+      CRUSTOXY_ENABLE_WARP: "false"
+
+  # Explicit opt-in mode for Cloudflare WARP. Start this service directly with:
+  # docker compose stop crustoxy
+  # docker compose --profile warp up -d crustoxy-warp
+  crustoxy-warp:
+    <<: *crustoxy-base
+    profiles:
+      - warp
+    container_name: crustoxy-warp
+    environment:
+      <<: *crustoxy-env
+      CRUSTOXY_ENABLE_WARP: "true"
     cap_add:
       - NET_ADMIN
     devices:

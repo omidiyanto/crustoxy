@@ -20,21 +20,26 @@ pub fn validate_api_key(
         None => return Err("Missing API key"),
     };
 
-    let mut extracted = header_str;
-    if let Some(stripped) = extracted.strip_prefix("Bearer ") {
-        extracted = stripped;
-    }
-    if let Some(stripped) = extracted.strip_prefix("bearer ") {
-        extracted = stripped;
-    }
+    let extracted = header_str
+        .strip_prefix("Bearer ")
+        .or_else(|| header_str.strip_prefix("bearer "))
+        .unwrap_or(header_str)
+        .trim();
 
-    if let Some(pos) = extracted.find(':') {
-        extracted = &extracted[..pos];
-    }
-
-    if extracted == token.as_str() {
+    if constant_time_eq(extracted.as_bytes(), token.as_bytes()) {
         Ok(())
     } else {
         Err("Invalid API key")
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }

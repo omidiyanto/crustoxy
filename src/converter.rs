@@ -1,6 +1,6 @@
 use crate::models::anthropic::*;
 use crate::models::openai::*;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub fn convert_messages(messages: &[Message]) -> Vec<ChatMessage> {
     let mut result = Vec::new();
@@ -341,6 +341,7 @@ pub fn convert_tools(tools: &[Tool], provider_type: &str) -> Vec<ChatTool> {
 
                     if provider_type == "nvidia_nim"
                         || provider_type == "moonshot"
+                        || provider_type == "kimi"
                         || provider_type == "kimi_oauth"
                     {
                         sanitize_schema_for_nim(&mut schema);
@@ -422,7 +423,8 @@ pub fn build_openai_request(
         .map(|t| convert_tools(t, provider_type));
     let strict_tool_choice = provider_type == "kimi_oauth"
         || provider_type == "nvidia_nim"
-        || provider_type == "moonshot";
+        || provider_type == "moonshot"
+        || provider_type == "kimi";
     let tool_choice = convert_tool_choice(&request.tool_choice, strict_tool_choice);
 
     let stream_options = if provider_type == "nvidia_nim" {
@@ -430,6 +432,19 @@ pub fn build_openai_request(
     } else {
         Some(serde_json::json!({"include_usage": true}))
     };
+
+    let mut extra_body = Map::new();
+    if let Some(top_k) = request.top_k {
+        extra_body.insert("top_k".to_string(), Value::from(top_k));
+    }
+    if let Some(thinking) = &request.thinking {
+        extra_body.insert("thinking".to_string(), thinking.clone());
+    }
+    if let Some(Value::Object(obj)) = &request.extra_body {
+        for (key, value) in obj {
+            extra_body.insert(key.clone(), value.clone());
+        }
+    }
 
     ChatCompletionRequest {
         model: model_name.to_string(),
@@ -442,6 +457,7 @@ pub fn build_openai_request(
         tools,
         tool_choice,
         stream_options,
+        extra_body,
     }
 }
 

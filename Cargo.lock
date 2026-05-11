@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "crustoxy"
-version = "2.2.5"
+version = "2.3.0"
 dependencies = [
  "arc-swap",
  "async-stream",

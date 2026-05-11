@@ -24,7 +24,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use axum::Router;
 use axum::routing::{get, post};
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -32,7 +32,6 @@ use config::Settings;
 use key_pool::KeyPoolManager;
 use model_router::ModelRouter;
 use panel_config::PanelConfig;
-use providers::OpenAICompatProvider;
 use routes::AppState;
 
 const BANNER: &str = "\n\
@@ -74,6 +73,10 @@ async fn main() {
 
     // Build runtime settings from panel config
     let settings = Settings::from_panel_config(&panel_config);
+    if let Err(e) = settings.validate_runtime_security() {
+        tracing::error!("{}", e);
+        std::process::exit(1);
+    }
 
     if !is_configured {
         println!(
@@ -96,47 +99,7 @@ async fn main() {
     key_pool_manager.spawn_recovery_task(recovery_interval);
 
     // ── Initialize providers ─────────────────────────────────────────────
-    let provider = OpenAICompatProvider::new(&settings);
-
-    let puter_provider = if let Some(ref creds) = settings.puter_api_key {
-        info!("Puter provider detected, initializing...");
-        match providers::PuterProvider::new(creds, &settings).await {
-            Ok(pp) => {
-                info!("Puter provider ready");
-                Some(Arc::new(pp))
-            }
-            Err(e) => {
-                tracing::error!("Failed to initialize Puter provider: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let kimi_oauth_provider = if settings.kimi_oauth_enable {
-        info!("Kimi OAuth provider detected, initializing...");
-        match providers::kimi_oauth::bootstrap_if_enabled(&settings).await {
-            Ok(Some(p)) => {
-                info!("Kimi OAuth provider ready");
-                Some(p)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::error!("Failed to initialize Kimi OAuth: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let cloudflare_provider = if settings.cloudflare_api_key.is_some() {
-        info!("Cloudflare provider detected, initializing...");
-        Some(Arc::new(providers::CloudflareProvider::new(&settings)))
-    } else {
-        None
-    };
+    let provider_bundle = routes::build_provider_bundle(&settings).await;
 
     // ── Build shared state ───────────────────────────────────────────────
     let state = Arc::new(AppState {
@@ -144,10 +107,10 @@ async fn main() {
         panel_config: ArcSwap::from_pointee(panel_config),
         key_pool_manager: key_pool_manager.clone(),
         model_router: model_router.clone(),
-        provider,
-        puter_provider,
-        kimi_oauth_provider,
-        cloudflare_provider,
+        provider: RwLock::new(provider_bundle.provider),
+        puter_provider: RwLock::new(provider_bundle.puter_provider),
+        kimi_oauth_provider: RwLock::new(provider_bundle.kimi_oauth_provider),
+        cloudflare_provider: RwLock::new(provider_bundle.cloudflare_provider),
     });
 
     // ── Config watcher for hot-reload ────────────────────────────────────
@@ -162,12 +125,17 @@ async fn main() {
                 Ok(new_config) => {
                     info!("Hot-reload: applying new configuration...");
                     let new_settings = Settings::from_panel_config(&new_config);
+                    if let Err(e) = new_settings.validate_runtime_security() {
+                        tracing::error!("Hot-reload rejected: {}", e);
+                        continue;
+                    }
                     let active = new_config.active_profile().clone();
 
-                    reload_state.settings.store(Arc::new(new_settings));
+                    reload_state.settings.store(Arc::new(new_settings.clone()));
                     reload_state.panel_config.store(Arc::new(new_config));
                     reload_state.key_pool_manager.reload(&active).await;
                     reload_state.model_router.reload(&active).await;
+                    reload_state.rebuild_providers(&new_settings).await;
 
                     // Sync WARP state
                     ip_rotator::sync_warp_state(active.features.enable_ip_rotation).await;

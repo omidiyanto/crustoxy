@@ -1,6 +1,7 @@
 use regex::Regex;
+use serde::Serialize;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::LazyLock;
 use uuid::Uuid;
 
@@ -15,7 +16,34 @@ const CONTROL_TOKEN_START: &str = "<|";
 pub struct DetectedTool {
     pub id: String,
     pub name: String,
-    pub input: HashMap<String, String>,
+    pub input: ToolInputMap,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ToolInputMap(Map<String, Value>);
+
+impl ToolInputMap {
+    fn new() -> Self {
+        Self(Map::new())
+    }
+
+    pub fn insert<V: Into<Value>>(&mut self, key: String, value: V) -> Option<Value> {
+        self.0.insert(key, value.into())
+    }
+}
+
+impl Deref for ToolInputMap {
+    type Target = Map<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ToolInputMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,7 +63,7 @@ pub struct HeuristicToolParser {
     buffer: String,
     current_tool_id: String,
     current_function_name: String,
-    current_parameters: HashMap<String, String>,
+    current_parameters: ToolInputMap,
 }
 
 static FUNC_START_RE: LazyLock<Regex> =
@@ -55,7 +83,7 @@ impl HeuristicToolParser {
             buffer: String::new(),
             current_tool_id: String::new(),
             current_function_name: String::new(),
-            current_parameters: HashMap::new(),
+            current_parameters: ToolInputMap::new(),
         }
     }
 
@@ -89,16 +117,12 @@ impl HeuristicToolParser {
                         }
 
                         // Parse JSON arguments into input map
-                        let mut input = HashMap::new();
+                        let mut input = ToolInputMap::new();
                         if let Ok(parsed) = serde_json::from_str::<Value>(&json_str)
                             && let Some(obj) = parsed.as_object()
                         {
                             for (k, v) in obj {
-                                let val = match v {
-                                    Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
-                                input.insert(k.clone(), val);
+                                input.insert(k.clone(), v.clone());
                             }
                         }
 
@@ -156,8 +180,11 @@ impl HeuristicToolParser {
                         self.state = ParserState::ParsingParameters;
                     } else if self.buffer.len() > 100 {
                         // Not a tool call, emit the bullet character and reset
-                        filtered_parts.push(self.buffer[..1].to_string());
-                        self.buffer = self.buffer[1..].to_string();
+                        if let Some(ch) = self.buffer.chars().next() {
+                            let char_len = ch.len_utf8();
+                            filtered_parts.push(self.buffer[..char_len].to_string());
+                            self.buffer = self.buffer[char_len..].to_string();
+                        }
                         self.state = ParserState::Text;
                     } else {
                         break; // Need more data
@@ -239,16 +266,12 @@ impl HeuristicToolParser {
         {
             let func_name = caps[1].to_string();
             let json_str = caps[2].to_string();
-            let mut input = HashMap::new();
+            let mut input = ToolInputMap::new();
             if let Ok(parsed) = serde_json::from_str::<Value>(&json_str)
                 && let Some(obj) = parsed.as_object()
             {
                 for (k, v) in obj {
-                    let val = match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    input.insert(k.clone(), val);
+                    input.insert(k.clone(), v.clone());
                 }
             }
             detected.push(DetectedTool {
@@ -391,4 +414,57 @@ pub fn recover_garbled_tool_json(content: &str) -> Option<RecoveredToolCall> {
     }
 
     Some(RecoveredToolCall { name, arguments })
+}
+
+pub fn task_arguments_with_foreground(args: &str) -> Option<String> {
+    if let Ok(mut parsed) = serde_json::from_str::<Value>(args) {
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("run_in_background".to_string(), Value::Bool(false));
+        }
+        return serde_json::to_string(&parsed).ok();
+    }
+
+    let garbled = format!(r#"{{"name": "Task", "arguments": {}}}"#, args);
+    recover_garbled_tool_json(&garbled).and_then(|recovered| {
+        let mut parsed = Value::Object(recovered.arguments);
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.insert("run_in_background".to_string(), Value::Bool(false));
+        }
+        serde_json::to_string(&parsed).ok()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HeuristicToolParser, task_arguments_with_foreground};
+    use serde_json::json;
+
+    #[test]
+    fn functions_call_preserves_json_value_types() {
+        let mut parser = HeuristicToolParser::new();
+        let (_, tools) = parser
+            .feed(r#"functions.Task:0{"description":"work","run_in_background":false,"count":2}"#);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].input.get("run_in_background"), Some(&json!(false)));
+        assert_eq!(tools[0].input.get("count"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn invalid_bullet_prefix_does_not_slice_inside_utf8_char() {
+        let mut parser = HeuristicToolParser::new();
+        let long_non_tool = format!("●{}", "x".repeat(101));
+        let (filtered, tools) = parser.feed(&long_non_tool);
+
+        assert_eq!(filtered, long_non_tool);
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn task_argument_patch_uses_boolean_false() {
+        let patched = task_arguments_with_foreground(r#"{"description":"work"}"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&patched).unwrap();
+
+        assert_eq!(value["run_in_background"], json!(false));
+    }
 }

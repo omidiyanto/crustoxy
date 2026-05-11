@@ -76,38 +76,17 @@ pub fn load_or_create(config_path: &Path) -> ConfigLoadResult {
 
 /// Check if legacy env vars are present (any model or provider key).
 fn has_legacy_env_vars() -> bool {
-    let legacy_keys = [
-        "MODEL",
-        "MODEL_OPUS",
-        "MODEL_SONNET",
-        "MODEL_HAIKU",
-        "OPENROUTER_API_KEY",
-        "GROQ_API_KEY",
-        "OPENAI_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "NVIDIA_NIM_API_KEY",
-        "SUMOPOD_API_KEY",
-    ];
-    legacy_keys
+    let model_keys = ["MODEL", "MODEL_OPUS", "MODEL_SONNET", "MODEL_HAIKU"];
+    model_keys
         .iter()
+        .chain(key_mappings().iter().map(|(_, key)| key))
+        .chain(url_mappings().iter().map(|(_, key)| key))
+        .chain(feature_env_keys().iter())
         .any(|k| env::var(k).ok().is_some_and(|v| !v.is_empty()))
 }
 
-/// Migrate legacy env vars into a `PanelConfig`.
-fn migrate_from_env() -> PanelConfig {
-    let mut config = PanelConfig::default();
-    let profile = config.active_profile_mut();
-
-    // Model mapping
-    profile.model_mapping = ModelMapping {
-        default: env_or("MODEL", "openrouter/meta-llama/llama-3-8b-instruct:free"),
-        opus: env_or_empty("MODEL_OPUS"),
-        sonnet: env_or_empty("MODEL_SONNET"),
-        haiku: env_or_empty("MODEL_HAIKU"),
-    };
-
-    // Provider keys — migrate all known providers
-    let key_mappings = [
+fn key_mappings() -> &'static [(&'static str, &'static str)] {
+    &[
         ("openai", "OPENAI_API_KEY"),
         ("sumopod", "SUMOPOD_API_KEY"),
         ("openrouter", "OPENROUTER_API_KEY"),
@@ -129,16 +108,14 @@ fn migrate_from_env() -> PanelConfig {
         ("modal", "MODAL_API_KEY"),
         ("opencode_zen", "OPENCODE_ZEN_API_KEY"),
         ("cloudflare", "CLOUDFLARE_API_KEY"),
-    ];
+        ("kimi_oauth", "KIMI_OAUTH_API_KEY"),
+        ("puter", "PUTER_API_KEY"),
+        ("custom", "CUSTOM_API_KEY"),
+    ]
+}
 
-    for (provider, env_key) in key_mappings {
-        if let Some(key) = env_or_none(env_key) {
-            profile.provider_keys.insert(provider.to_string(), key);
-        }
-    }
-
-    // Provider base URL overrides
-    let url_mappings = [
+fn url_mappings() -> &'static [(&'static str, &'static str)] {
+    &[
         ("openai", "OPENAI_BASE_URL"),
         ("sumopod", "SUMOPOD_BASE_URL"),
         ("openrouter", "OPENROUTER_BASE_URL"),
@@ -165,17 +142,62 @@ fn migrate_from_env() -> PanelConfig {
         ("vllm", "VLLM_BASE_URL"),
         ("llamacpp", "LLAMACPP_BASE_URL"),
         ("custom", "CUSTOM_BASE_URL"),
-    ];
+        ("kimi_oauth", "KIMI_OAUTH_BASE_URL"),
+    ]
+}
 
-    for (provider, env_key) in url_mappings {
+fn feature_env_keys() -> &'static [&'static str] {
+    &[
+        "ENABLE_IP_ROTATION",
+        "ENABLE_NETWORK_PROBE_MOCK",
+        "ENABLE_TITLE_GENERATION_SKIP",
+        "ENABLE_SUGGESTION_MODE_SKIP",
+        "FAST_PREFIX_DETECTION",
+        "ENABLE_FILEPATH_EXTRACTION_MOCK",
+        "ENABLE_TOOL_RETRY",
+        "TOOL_RETRY_MAX",
+        "ENABLE_RTK",
+        "OVERRIDE_SYSTEM_PROMPT",
+        "PROVIDER_RATE_LIMIT",
+        "PROVIDER_RATE_WINDOW",
+        "PROVIDER_MAX_CONCURRENCY",
+        "HTTP_READ_TIMEOUT",
+        "HTTP_CONNECT_TIMEOUT",
+    ]
+}
+
+/// Migrate legacy env vars into a `PanelConfig`.
+fn migrate_from_env() -> PanelConfig {
+    let mut config = PanelConfig::default();
+    let profile = config.active_profile_mut();
+
+    // Model mapping
+    profile.model_mapping = ModelMapping {
+        default: env_or("MODEL", "openrouter/meta-llama/llama-3-8b-instruct:free"),
+        opus: env_or_empty("MODEL_OPUS"),
+        sonnet: env_or_empty("MODEL_SONNET"),
+        haiku: env_or_empty("MODEL_HAIKU"),
+    };
+
+    // Provider keys — migrate all known providers
+    for (provider, env_key) in key_mappings() {
+        if let Some(key) = env_or_none(env_key) {
+            profile.provider_keys.insert((*provider).to_string(), key);
+        }
+    }
+
+    // Provider base URL overrides
+    for (provider, env_key) in url_mappings() {
         if let Some(url) = env_or_none(env_key) {
-            profile.provider_base_urls.insert(provider.to_string(), url);
+            profile
+                .provider_base_urls
+                .insert((*provider).to_string(), url);
         }
     }
 
     // Feature flags
     profile.features = FeatureFlags {
-        enable_ip_rotation: env_bool("ENABLE_IP_ROTATION", true),
+        enable_ip_rotation: env_bool("ENABLE_IP_ROTATION", false),
         enable_network_probe_mock: env_bool("ENABLE_NETWORK_PROBE_MOCK", true),
         enable_title_generation_skip: env_bool("ENABLE_TITLE_GENERATION_SKIP", true),
         enable_suggestion_mode_skip: env_bool("ENABLE_SUGGESTION_MODE_SKIP", true),

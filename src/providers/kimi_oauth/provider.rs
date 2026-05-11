@@ -10,17 +10,18 @@ use uuid::Uuid;
 use crate::config::Settings;
 use crate::converter::map_stop_reason;
 use crate::models::anthropic::MessagesRequest;
-use crate::models::openai::ChatCompletionChunk;
+use crate::models::openai::{ChatCompletionChunk, parse_sse_data_line};
 use crate::rate_limiter::RateLimiter;
 use crate::sse::SSEBuilder;
 
-use super::auth::{AuthManager, api_base_url, build_common_headers};
+use super::auth::{AuthManager, build_common_headers};
 use super::translate::build_kimi_request;
 
 pub struct KimiOauthProvider {
     client: Client,
     auth: Arc<AuthManager>,
     rate_limiter: Arc<RateLimiter>,
+    api_base_url: String,
 }
 
 impl KimiOauthProvider {
@@ -41,6 +42,7 @@ impl KimiOauthProvider {
             client,
             auth,
             rate_limiter,
+            api_base_url: settings.provider_base_url("kimi_oauth"),
         }
     }
 
@@ -59,7 +61,10 @@ impl KimiOauthProvider {
             obj.insert("stream".to_string(), serde_json::json!(true));
         }
 
-        let url = format!("{}/chat/completions", api_base_url().trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.api_base_url.trim_end_matches('/')
+        );
         let client = self.client.clone();
         let auth = self.auth.clone();
         let rate_limiter = self.rate_limiter.clone();
@@ -115,26 +120,41 @@ impl KimiOauthProvider {
                         let mut line_buffer = String::new();
                         let mut finish_reason: Option<String> = None;
                         let mut usage_output_tokens: Option<u32> = None;
+                        let mut had_tool_call = false;
+                        let mut stream_read_error: Option<String> = None;
 
-                        while let Some(chunk_result) = byte_stream.next().await {
-                            let bytes = match chunk_result {
-                                Ok(b) => b,
-                                Err(e) => break 'auth_loop format!("Stream error: {}", e),
+                        'stream: loop {
+                            let stream_ended = match byte_stream.next().await {
+                                Some(Ok(bytes)) => {
+                                    line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                    false
+                                }
+                                Some(Err(e)) => {
+                                    stream_read_error = Some(format!("Stream error: {}", e));
+                                    break 'stream;
+                                }
+                                None => {
+                                    if line_buffer.trim().is_empty() {
+                                        break 'stream;
+                                    }
+                                    line_buffer.push('\n');
+                                    true
+                                }
                             };
-
-                            line_buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                             while let Some(newline_pos) = line_buffer.find('\n') {
                                 let line = line_buffer[..newline_pos].trim().to_string();
                                 line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-                                if line.is_empty() || !line.starts_with("data: ") {
+                                if line.is_empty() {
                                     continue;
                                 }
 
-                                let data = &line[6..];
+                                let Some(data) = parse_sse_data_line(&line) else {
+                                    continue;
+                                };
                                 if data == "[DONE]" {
-                                    break;
+                                    break 'stream;
                                 }
 
                                 let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
@@ -167,16 +187,28 @@ impl KimiOauthProvider {
                                         for event in sse.close_content_blocks() { yield event; }
                                         for tc in tool_calls {
                                             let tc_index = tc.index.unwrap_or(0);
-                                            if let Some(ref func) = tc.function
-                                                && let Some(ref name) = func.name {
-                                                    sse.blocks.register_tool_name(tc_index, name);
+                                            if let Some(ref id) = tc.id {
+                                                sse.blocks.register_tool_name(tc_index, "");
+                                                if let Some(state) = sse.blocks.tool_states.get_mut(&tc_index)
+                                                    && state.tool_id.is_empty()
+                                                {
+                                                    state.tool_id = id.clone();
                                                 }
+                                            }
+                                            if let Some(ref func) = tc.function
+                                                && let Some(ref name) = func.name
+                                                && !name.is_empty()
+                                            {
+                                                sse.blocks.register_tool_name(tc_index, name);
+                                            }
                                             let state_started = sse.blocks.tool_states.get(&tc_index).is_some_and(|s| s.started);
                                             if !state_started {
-                                                let tool_id = tc.id.clone().unwrap_or_else(|| format!("tool_{}", Uuid::new_v4()));
                                                 let name = sse.blocks.tool_states.get(&tc_index).map(|s| s.name.clone()).unwrap_or_default();
-                                                if name.is_empty() && tc.id.is_none() && let Some(ref func) = tc.function && func.arguments.as_ref().is_some_and(|a| !a.is_empty()) {
-                                                    if let Some(ref args) = func.arguments {
+                                                if name.is_empty() {
+                                                    if let Some(ref func) = tc.function
+                                                        && let Some(ref args) = func.arguments
+                                                        && !args.is_empty()
+                                                    {
                                                         sse.blocks.register_tool_name(tc_index, "");
                                                         if let Some(state) = sse.blocks.tool_states.get_mut(&tc_index) {
                                                             state.contents.push(args.clone());
@@ -184,28 +216,76 @@ impl KimiOauthProvider {
                                                     }
                                                     continue;
                                                 }
+                                                let buffered_args = sse.blocks.tool_states
+                                                    .get(&tc_index)
+                                                    .map(|s| s.contents.clone())
+                                                    .unwrap_or_default();
+                                                let tool_id = sse.blocks.tool_states
+                                                    .get(&tc_index)
+                                                    .and_then(|s| (!s.tool_id.is_empty()).then(|| s.tool_id.clone()))
+                                                    .or_else(|| tc.id.clone())
+                                                    .unwrap_or_else(|| format!("tool_{}", Uuid::new_v4()));
+                                                had_tool_call = true;
                                                 yield sse.start_tool_block(tc_index, &tool_id, &name);
+                                                if !buffered_args.is_empty() && name != "Task" {
+                                                    let block_idx = sse.blocks.tool_states
+                                                        .get(&tc_index)
+                                                        .map(|s| s.block_index as u32)
+                                                        .unwrap_or(0);
+                                                    for args in &buffered_args {
+                                                        yield sse.content_block_delta(
+                                                            block_idx,
+                                                            "input_json_delta",
+                                                            args,
+                                                        );
+                                                    }
+                                                }
                                             }
                                             if let Some(ref func) = tc.function
                                                 && let Some(ref args) = func.arguments
                                                     && !args.is_empty() {
+                                                        let current_name = sse.blocks.tool_states
+                                                            .get(&tc_index)
+                                                            .map(|s| s.name.as_str())
+                                                            .unwrap_or("");
+                                                        if current_name == "Task" {
+                                                            if let Some(state) = sse.blocks.tool_states.get_mut(&tc_index) {
+                                                                state.contents.push(args.clone());
+                                                            }
+                                                        } else {
                                                         yield sse.emit_tool_delta(tc_index, args);
+                                                        }
                                                     }
                                         }
                                     }
                                 }
                             }
+                            if stream_ended {
+                                break 'stream;
+                            }
                         }
 
-                        if !sse.has_any_content() {
+                        if let Some(err) = stream_read_error {
+                            break 'auth_loop err;
+                        }
+
+                        let has_started_content = sse.blocks.text_index >= 0
+                            || sse.blocks.thinking_index >= 0
+                            || sse.blocks.tool_states.values().any(|state| state.started);
+                        if !had_tool_call && !has_started_content {
                             for event in sse.ensure_text_block() { yield event; }
                             yield sse.emit_text_delta(" ");
                         }
 
+                        for event in sse.flush_task_tool_inputs() { yield event; }
                         for event in sse.close_all_blocks() { yield event; }
 
                         let output_tokens = usage_output_tokens.unwrap_or_else(|| sse.estimate_output_tokens());
-                        let stop = map_stop_reason(finish_reason.as_deref());
+                        let stop = if had_tool_call {
+                            "tool_use"
+                        } else {
+                            map_stop_reason(finish_reason.as_deref())
+                        };
                         yield sse.message_delta(stop, output_tokens);
                         yield sse.message_stop();
                         return;
@@ -232,7 +312,10 @@ impl KimiOauthProvider {
             obj.insert("stream".to_string(), serde_json::json!(false));
         }
 
-        let url = format!("{}/chat/completions", api_base_url().trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.api_base_url.trim_end_matches('/')
+        );
 
         let mut auth_attempts = 0;
         loop {
@@ -311,8 +394,13 @@ impl KimiOauthProvider {
                         .and_then(|f| f.get("arguments"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    let input: Value =
+                    let mut input: Value =
                         serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
+                    if name == "Task"
+                        && let Some(obj) = input.as_object_mut()
+                    {
+                        obj.insert("run_in_background".to_string(), serde_json::json!(false));
+                    }
                     content_blocks.push(serde_json::json!({
                         "type": "tool_use",
                         "id": id,
@@ -321,6 +409,10 @@ impl KimiOauthProvider {
                     }));
                 }
             }
+
+            let emitted_tool = content_blocks
+                .iter()
+                .any(|block| block.get("type").and_then(|v| v.as_str()) == Some("tool_use"));
 
             if content_blocks.is_empty() {
                 content_blocks.push(serde_json::json!({"type": "text", "text": " "}));
@@ -331,7 +423,11 @@ impl KimiOauthProvider {
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u32;
-            let stop_reason = map_stop_reason(Some(finish));
+            let stop_reason = if emitted_tool {
+                "tool_use"
+            } else {
+                map_stop_reason(Some(finish))
+            };
 
             return Ok(serde_json::json!({
                 "id": message_id,

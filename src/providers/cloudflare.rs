@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,11 +11,11 @@ use uuid::Uuid;
 
 use crate::key_pool::KeyPoolManager;
 
-use crate::config::{Settings, get_provider_api_key, get_provider_base_url};
+use crate::config::{Settings, get_provider_default_base_url};
 use crate::converter::{build_openai_request, map_stop_reason};
 use crate::heuristic_tool_parser::HeuristicToolParser;
 use crate::models::anthropic::MessagesRequest;
-use crate::models::openai::{ChatCompletionChunk, ChatMessage};
+use crate::models::openai::{ChatCompletionChunk, ChatMessage, parse_sse_data_line};
 use crate::rate_limiter::RateLimiter;
 use crate::sse::SSEBuilder;
 use crate::think_parser::{ContentType, ThinkTagParser};
@@ -26,6 +27,7 @@ pub struct CloudflareProvider {
     enable_ip_rotation: bool,
     enable_tool_retry: bool,
     tool_retry_max: u32,
+    provider_base_urls: HashMap<String, String>,
 }
 
 impl CloudflareProvider {
@@ -49,6 +51,7 @@ impl CloudflareProvider {
             enable_ip_rotation: settings.enable_ip_rotation,
             enable_tool_retry: settings.enable_tool_retry,
             tool_retry_max: settings.tool_retry_max,
+            provider_base_urls: settings.provider_base_urls.clone(),
         }
     }
 
@@ -76,6 +79,7 @@ impl CloudflareProvider {
         let _enable_ip_rotation = self.enable_ip_rotation;
         let enable_tool_retry = self.enable_tool_retry;
         let tool_retry_max = self.tool_retry_max;
+        let provider_base_urls = self.provider_base_urls.clone();
 
         let initial_provider = Settings::parse_provider_type(&resolved_spec).to_string();
         let initial_model = Settings::parse_model_name(&resolved_spec).to_string();
@@ -103,21 +107,16 @@ impl CloudflareProvider {
             'tool_retry: while tool_attempt < max_tool_attempts {
                 let provider_type = Settings::parse_provider_type(&resolved_spec).to_string();
                 let model_name = Settings::parse_model_name(&resolved_spec).to_string();
-                let base_url = get_provider_base_url(&provider_type);
+                let base_url = provider_base_url_from(&provider_base_urls, &provider_type);
 
                 // ── 3-tier escalation: key rotation → model fallback → IP rotation ──
                 'key_rotation: loop {
                     let key_ep = key_pool.acquire(&provider_type).await;
-                    let api_key_full = key_ep.as_ref()
-                        .map(|ep| ep.key.clone())
-                        .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
-
-                    let parts: Vec<&str> = api_key_full.split(':').collect();
-                    let account_id = parts.first().unwrap_or(&"").to_string();
-                    let auth_token = parts.get(1).unwrap_or(&"").to_string();
+                    let has_key_pool = key_pool.has_pool(&provider_type).await;
+                    let api_key_full = key_ep.as_ref().map(|ep| ep.key.clone()).unwrap_or_default();
                     let key_preview = crate::key_pool::mask_key(&api_key_full);
 
-                    if key_ep.is_none() && key_pool.all_exhausted(&provider_type).await {
+                    if key_ep.is_none() && has_key_pool && key_pool.all_exhausted(&provider_type).await {
                         // All keys for this provider are on cooldown → escalate to model fallback
                         warn!(
                             "ALL_KEYS_EXHAUSTED: provider={} → escalating to model fallback",
@@ -125,6 +124,16 @@ impl CloudflareProvider {
                         );
                         break 'key_rotation;
                     }
+
+                    let Some((account_id, auth_token)) = parse_cloudflare_key(&api_key_full) else {
+                        last_error = Some(
+                            "Cloudflare key must use account_id:api_token format".to_string(),
+                        );
+                        if let Some(ep) = &key_ep {
+                            key_pool.report_error(ep, false).await;
+                        }
+                        break 'key_rotation;
+                    };
 
                     let url = format!(
                         "{}/{}/ai/run/{}",
@@ -169,7 +178,10 @@ impl CloudflareProvider {
                                     tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                     continue;
                                 }
-                                continue 'key_rotation;
+                                if has_key_pool {
+                                    continue 'key_rotation;
+                                }
+                                break 'key_rotation;
                             }
                             Ok(response) => {
                                 let status = response.status().as_u16();
@@ -183,22 +195,19 @@ impl CloudflareProvider {
                                         request_id, provider_type, key_preview
                                     );
                                     last_error = Some(format!("Rate limit (429) on key {}", key_preview));
-                                    continue 'key_rotation;
+                                    if has_key_pool {
+                                        continue 'key_rotation;
+                                    }
+                                    break 'key_rotation;
                                 }
 
                                 if status >= 400 {
                                     let body_text = response.text().await.unwrap_or_default();
-                                    error!("Provider error {}: {}", status, body_text);
-
-                                    if status == 500 && body_text.contains("unhashable") {
-                                        error!("Captured unhashable-error payload → failed_payload.json");
-                                        std::fs::write(
-                                            "failed_payload.json",
-                                            serde_json::to_string_pretty(&current_body).unwrap_or_default(),
-                                        ).ok();
-                                    }
-
                                     let provider_msg = extract_provider_error(&body_text);
+                                    error!(
+                                        "Provider error status={} request_id={}",
+                                        status, request_id
+                                    );
                                     last_error = Some(format!(
                                         "Provider returned status {} (request_id={}): {}",
                                         status, request_id, provider_msg
@@ -215,7 +224,10 @@ impl CloudflareProvider {
                                             tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                             continue;
                                         }
-                                        continue 'key_rotation;
+                                        if has_key_pool {
+                                            continue 'key_rotation;
+                                        }
+                                        break 'key_rotation;
                                     }
                                     break 'key_rotation;
                                 }
@@ -224,10 +236,12 @@ impl CloudflareProvider {
                                     // Report success (approximated latency, can be enhanced)
                                     key_pool.report_success(ep, 100).await;
                                 }
+                                model_router.report_success_by_spec(&resolved_spec).await;
                                 info!(
                                     "CF_STREAM_OK: request_id={} provider={} model={} key={}",
                                     request_id, provider_type, model_name, key_preview
                                 );
+                                last_error = None;
 
                                 // ── Successful response: process stream ──────────
                             let mut think_parser = ThinkTagParser::new();
@@ -238,30 +252,41 @@ impl CloudflareProvider {
                             let mut line_buffer = String::new();
                             let mut attempt_text = String::new();
                             let mut attempt_had_tool = false;
+                            let mut stream_read_error: Option<String> = None;
 
-                            while let Some(chunk_result) = byte_stream.next().await {
-                                let bytes = match chunk_result {
-                                    Ok(b) => b,
-                                    Err(e) => {
+                            'stream: loop {
+                                let stream_ended = match byte_stream.next().await {
+                                    Some(Ok(bytes)) => {
+                                        line_buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                        false
+                                    }
+                                    Some(Err(e)) => {
                                         error!("Stream read error: {}", e);
-                                        last_error = Some(format!("error decoding response body: {}", e));
-                                        break;
+                                        stream_read_error = Some(format!("error decoding response body: {}", e));
+                                        break 'stream;
+                                    }
+                                    None => {
+                                        if line_buffer.trim().is_empty() {
+                                            break 'stream;
+                                        }
+                                        line_buffer.push('\n');
+                                        true
                                     }
                                 };
-
-                                line_buffer.push_str(&String::from_utf8_lossy(&bytes));
 
                                 while let Some(newline_pos) = line_buffer.find('\n') {
                                     let line = line_buffer[..newline_pos].trim().to_string();
                                     line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-                                    if line.is_empty() || !line.starts_with("data: ") {
+                                    if line.is_empty() {
                                         continue;
                                     }
 
-                                    let data = &line[6..];
+                                    let Some(data) = parse_sse_data_line(&line) else {
+                                        continue;
+                                    };
                                     if data == "[DONE]" {
-                                        break;
+                                        break 'stream;
                                     }
 
                                     let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
@@ -332,7 +357,7 @@ impl CloudflareProvider {
                                                             if tool_use.name == "Task" {
                                                                 input.insert(
                                                                     "run_in_background".to_string(),
-                                                                    "false".to_string(),
+                                                                    json!(false),
                                                                 );
                                                             }
                                                             let input_json = serde_json::to_string(&input)
@@ -360,30 +385,38 @@ impl CloudflareProvider {
                                                 yield event;
                                             }
                                             for tc in tool_calls {
-                                                attempt_had_tool = true;
                                                 let tc_index = tc.index.unwrap_or(0);
 
-                                                if let Some(ref func) = tc.function
-                                                    && let Some(ref name) = func.name {
-                                                        sse.blocks.register_tool_name(tc_index, name);
+                                                if let Some(ref id) = tc.id {
+                                                    sse.blocks.register_tool_name(tc_index, "");
+                                                    if let Some(state) = sse.blocks.tool_states.get_mut(&tc_index)
+                                                        && state.tool_id.is_empty()
+                                                    {
+                                                        state.tool_id = id.clone();
                                                     }
+                                                }
+
+                                                if let Some(ref func) = tc.function
+                                                    && let Some(ref name) = func.name
+                                                    && !name.is_empty()
+                                                {
+                                                    sse.blocks.register_tool_name(tc_index, name);
+                                                }
 
                                                 let state_started = sse.blocks.tool_states
                                                     .get(&tc_index)
                                                     .is_some_and(|s| s.started);
 
                                                 if !state_started {
-                                                    let tool_id = tc.id.clone().unwrap_or_else(|| format!("tool_{}", Uuid::new_v4()));
                                                     let name = sse.blocks.tool_states.get(&tc_index)
                                                         .map(|s| s.name.clone())
                                                         .unwrap_or_default();
 
-                                                    if name.is_empty() && tc.id.is_none()
-                                                        && let Some(ref func) = tc.function
-                                                        && func.arguments.as_ref().is_some_and(|a| !a.is_empty())
-                                                    {
-                                                        // Buffer args; don't start block until we have a name
-                                                        if let Some(ref args) = func.arguments {
+                                                    if name.is_empty() {
+                                                        if let Some(ref func) = tc.function
+                                                            && let Some(ref args) = func.arguments
+                                                            && !args.is_empty()
+                                                        {
                                                             sse.blocks.register_tool_name(tc_index, "");
                                                             if let Some(state) = sse.blocks.tool_states.get_mut(&tc_index) {
                                                                 state.contents.push(args.clone());
@@ -392,7 +425,32 @@ impl CloudflareProvider {
                                                         continue;
                                                     }
 
+                                                    let buffered_args = sse.blocks.tool_states
+                                                        .get(&tc_index)
+                                                        .map(|s| s.contents.clone())
+                                                        .unwrap_or_default();
+                                                    let tool_id = sse.blocks.tool_states
+                                                        .get(&tc_index)
+                                                        .and_then(|s| (!s.tool_id.is_empty()).then(|| s.tool_id.clone()))
+                                                        .or_else(|| tc.id.clone())
+                                                        .unwrap_or_else(|| format!("tool_{}", Uuid::new_v4()));
+
+                                                    attempt_had_tool = true;
                                                     yield sse.start_tool_block(tc_index, &tool_id, &name);
+
+                                                if !buffered_args.is_empty() && name != "Task" {
+                                                    let block_idx = sse.blocks.tool_states
+                                                        .get(&tc_index)
+                                                        .map(|s| s.block_index as u32)
+                                                        .unwrap_or(0);
+                                                    for args in &buffered_args {
+                                                        yield sse.content_block_delta(
+                                                            block_idx,
+                                                            "input_json_delta",
+                                                            args,
+                                                        );
+                                                    }
+                                                }
                                                 }
 
                                                 if let Some(ref func) = tc.function
@@ -404,49 +462,26 @@ impl CloudflareProvider {
                                                                 .map(|s| s.name.as_str())
                                                                 .unwrap_or("");
 
-                                                            if current_name == "Task" {
-                                                                let state = sse.blocks.tool_states.get_mut(&tc_index);
-                                                                if let Some(state) = state {
-                                                                    state.contents.push(args.clone());
-                                                                    // Try parsing the accumulated JSON
-                                                                    let accumulated: String = state.contents.iter().cloned().collect();
-                                                                    let mut patched = String::new();
-                                                                    if let Ok(mut parsed) = serde_json::from_str::<Value>(&accumulated) {
-                                                                        if let Some(obj) = parsed.as_object_mut() {
-                                                                            obj.insert("run_in_background".to_string(), json!(false));
-                                                                        }
-                                                                        patched = serde_json::to_string(&parsed).unwrap_or_default();
-                                                                    } else {
-                                                                        let garbled = format!(r#"{{"name": "Task", "arguments": {}}}"#, accumulated);
-                                                                        if let Some(recovered) = crate::heuristic_tool_parser::recover_garbled_tool_json(&garbled) {
-                                                                            let mut parsed = serde_json::Value::Object(recovered.arguments);
-                                                                            if let Some(obj) = parsed.as_object_mut() {
-                                                                                obj.insert("run_in_background".to_string(), json!(false));
-                                                                            }
-                                                                            patched = serde_json::to_string(&parsed).unwrap_or_default();
-                                                                        }
-                                                                    }
-
-                                                                    if !patched.is_empty() {
-                                                                        let block_idx = state.block_index;
-                                                                        yield sse.content_block_delta(
-                                                                            block_idx as u32,
-                                                                            "input_json_delta",
-                                                                            &patched,
-                                                                        );
-                                                                    }
-                                                                }
-                                                            } else {
-                                                                yield sse.emit_tool_delta(tc_index, args);
+                                                        if current_name == "Task" {
+                                                            let state = sse.blocks.tool_states.get_mut(&tc_index);
+                                                            if let Some(state) = state {
+                                                                state.contents.push(args.clone());
+                                                            }
+                                                        } else {
+                                                            yield sse.emit_tool_delta(tc_index, args);
                                                             }
                                                         }
                                             }
                                         }
                                     }
                                 }
+                                if stream_ended {
+                                    break 'stream;
+                                }
                             }
 
-                            if last_error.is_some() {
+                            if let Some(err) = stream_read_error {
+                                last_error = Some(err);
                                 break 'tool_retry;
                             }
 
@@ -478,7 +513,7 @@ impl CloudflareProvider {
                                 let block_idx = sse.blocks.allocate_index();
                                 let mut input = tool_use.input.clone();
                                 if tool_use.name == "Task" {
-                                    input.insert("run_in_background".to_string(), "false".to_string());
+                                    input.insert("run_in_background".to_string(), json!(false));
                                 }
                                 let input_json = serde_json::to_string(&input)
                                     .unwrap_or_else(|_| "{}".to_string());
@@ -544,19 +579,29 @@ impl CloudflareProvider {
                             }
 
                             // ── No retry needed: finalize response ───────
-                            if !sse.has_any_content() {
+                            let has_started_content = sse.blocks.text_index >= 0
+                                || sse.blocks.thinking_index >= 0
+                                || sse.blocks.tool_states.values().any(|state| state.started);
+                            if !had_tool_call && !has_started_content {
                                 for event in sse.ensure_text_block() {
                                     yield event;
                                 }
                                 yield sse.emit_text_delta(" ");
                             }
 
+                            for event in sse.flush_task_tool_inputs() {
+                                yield event;
+                            }
                             for event in sse.close_all_blocks() {
                                 yield event;
                             }
 
                             let output_tokens = final_output_tokens.unwrap_or_else(|| sse.estimate_output_tokens());
-                            let stop = map_stop_reason(final_finish_reason.as_deref());
+                            let stop = if had_tool_call {
+                                "tool_use"
+                            } else {
+                                map_stop_reason(final_finish_reason.as_deref())
+                            };
                             yield sse.message_delta(stop, output_tokens);
                             yield sse.message_stop();
                             return;
@@ -645,7 +690,7 @@ impl CloudflareProvider {
         'model_fallback: loop {
             let provider_type = Settings::parse_provider_type(&resolved_spec).to_string();
             let model_name = Settings::parse_model_name(&resolved_spec).to_string();
-            let base_url = get_provider_base_url(&provider_type);
+            let base_url = provider_base_url_from(&self.provider_base_urls, &provider_type);
 
             let mut body = build_openai_request(request, &model_name, &provider_type);
             body.stream = false;
@@ -654,23 +699,26 @@ impl CloudflareProvider {
             // ── Key rotation loop ──
             'key_rotation: loop {
                 let key_ep = key_pool.acquire(&provider_type).await;
-                let api_key_full = key_ep
-                    .as_ref()
-                    .map(|ep| ep.key.clone())
-                    .unwrap_or_else(|| get_provider_api_key(&provider_type).unwrap_or_default());
-
-                let parts: Vec<&str> = api_key_full.split(':').collect();
-                let account_id = parts.first().unwrap_or(&"").to_string();
-                let auth_token = parts.get(1).unwrap_or(&"").to_string();
+                let has_key_pool = key_pool.has_pool(&provider_type).await;
+                let api_key_full = key_ep.as_ref().map(|ep| ep.key.clone()).unwrap_or_default();
                 let key_preview = crate::key_pool::mask_key(&api_key_full);
 
-                if key_ep.is_none() && key_pool.all_exhausted(&provider_type).await {
+                if key_ep.is_none() && has_key_pool && key_pool.all_exhausted(&provider_type).await
+                {
                     warn!(
                         "ALL_KEYS_EXHAUSTED: provider={} → escalating to model fallback",
                         provider_type
                     );
                     break 'key_rotation;
                 }
+
+                let Some((account_id, auth_token)) = parse_cloudflare_key(&api_key_full) else {
+                    if let Some(ep) = &key_ep {
+                        key_pool.report_error(ep, false).await;
+                    }
+                    last_error = "Cloudflare key must use account_id:api_token format".to_string();
+                    break 'key_rotation;
+                };
 
                 let url = format!(
                     "{}/{}/ai/run/{}",
@@ -712,7 +760,10 @@ impl CloudflareProvider {
                                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                 continue;
                             }
-                            continue 'key_rotation;
+                            if has_key_pool {
+                                continue 'key_rotation;
+                            }
+                            break 'key_rotation;
                         }
                         Ok(response) => {
                             let status = response.status().as_u16();
@@ -726,7 +777,10 @@ impl CloudflareProvider {
                                     request_id, provider_type, key_preview
                                 );
                                 last_error = format!("Rate limit (429) on key {}", key_preview);
-                                continue 'key_rotation;
+                                if has_key_pool {
+                                    continue 'key_rotation;
+                                }
+                                break 'key_rotation;
                             }
 
                             if status >= 400 {
@@ -745,7 +799,10 @@ impl CloudflareProvider {
                                         tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                                         continue;
                                     }
-                                    continue 'key_rotation;
+                                    if has_key_pool {
+                                        continue 'key_rotation;
+                                    }
+                                    break 'key_rotation;
                                 }
                                 break 'key_rotation;
                             }
@@ -753,6 +810,7 @@ impl CloudflareProvider {
                             if let Some(ep) = &key_ep {
                                 key_pool.report_success(ep, 100).await;
                             }
+                            model_router.report_success_by_spec(&resolved_spec).await;
 
                             // ── Success: parse response ──
                             let resp_body: Value = response
@@ -806,7 +864,7 @@ impl CloudflareProvider {
                                         .and_then(|f| f.get("arguments"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("{}");
-                                    let input: Value = match serde_json::from_str(args_str) {
+                                    let mut input: Value = match serde_json::from_str(args_str) {
                                         Ok(val) => val,
                                         Err(_) => {
                                             let garbled = format!(
@@ -820,6 +878,11 @@ impl CloudflareProvider {
                                             .unwrap_or_else(|| json!({}))
                                         }
                                     };
+                                    if name == "Task"
+                                        && let Some(obj) = input.as_object_mut()
+                                    {
+                                        obj.insert("run_in_background".to_string(), json!(false));
+                                    }
                                     content_blocks.push(json!({
                                         "type": "tool_use",
                                         "id": id,
@@ -828,6 +891,10 @@ impl CloudflareProvider {
                                     }));
                                 }
                             }
+
+                            let emitted_tool = content_blocks.iter().any(|block| {
+                                block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                            });
 
                             if content_blocks.is_empty() {
                                 content_blocks.push(json!({"type": "text", "text": " "}));
@@ -840,7 +907,11 @@ impl CloudflareProvider {
                                 .unwrap_or(1)
                                 as u32;
 
-                            let stop_reason = map_stop_reason(Some(finish));
+                            let stop_reason = if emitted_tool {
+                                "tool_use"
+                            } else {
+                                map_stop_reason(Some(finish))
+                            };
 
                             return Ok(json!({
                                 "id": message_id,
@@ -926,8 +997,8 @@ fn extract_provider_error(body: &str) -> String {
         }
     }
     // Not JSON, return truncated raw body
-    if body.len() > 200 {
-        format!("{}...", &body[..200])
+    if body.chars().count() > 200 {
+        format!("{}...", body.chars().take(200).collect::<String>())
     } else {
         body.to_string()
     }
@@ -945,4 +1016,24 @@ fn rand_jitter() -> f64 {
         .bytes()
         .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     (nanos.wrapping_add(tid_hash) % 1000) as f64 / 1000.0
+}
+
+fn provider_base_url_from(overrides: &HashMap<String, String>, provider_name: &str) -> String {
+    overrides
+        .get(provider_name)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| get_provider_default_base_url(provider_name))
+}
+
+fn parse_cloudflare_key(raw: &str) -> Option<(&str, &str)> {
+    let (account_id, token) = raw.split_once(':')?;
+    let account_id = account_id.trim();
+    let token = token.trim();
+    if account_id.is_empty() || token.is_empty() {
+        None
+    } else {
+        Some((account_id, token))
+    }
 }

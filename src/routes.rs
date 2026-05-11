@@ -8,6 +8,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::auth::validate_api_key;
@@ -16,7 +17,8 @@ use crate::converter::count_request_tokens;
 use crate::key_pool::KeyPoolManager;
 use crate::model_router::ModelRouter;
 use crate::models::anthropic::{
-    MessagesRequest, SystemPrompt, TokenCountRequest, extract_text_from_system,
+    ContentBlock, MessageContent, MessagesRequest, SystemPrompt, TokenCountRequest,
+    extract_text_from_system,
 };
 use crate::optimization::try_optimizations;
 use crate::panel_config::PanelConfig;
@@ -30,10 +32,81 @@ pub struct AppState {
     pub panel_config: ArcSwap<PanelConfig>,
     pub key_pool_manager: Arc<KeyPoolManager>,
     pub model_router: Arc<ModelRouter>,
-    pub provider: OpenAICompatProvider,
+    pub provider: RwLock<Arc<OpenAICompatProvider>>,
+    pub puter_provider: RwLock<Option<Arc<PuterProvider>>>,
+    pub kimi_oauth_provider: RwLock<Option<Arc<crate::providers::kimi_oauth::KimiOauthProvider>>>,
+    pub cloudflare_provider: RwLock<Option<Arc<crate::providers::CloudflareProvider>>>,
+}
+
+pub struct ProviderBundle {
+    pub provider: Arc<OpenAICompatProvider>,
     pub puter_provider: Option<Arc<PuterProvider>>,
     pub kimi_oauth_provider: Option<Arc<crate::providers::kimi_oauth::KimiOauthProvider>>,
     pub cloudflare_provider: Option<Arc<crate::providers::CloudflareProvider>>,
+}
+
+pub async fn build_provider_bundle(settings: &Settings) -> ProviderBundle {
+    let provider = Arc::new(OpenAICompatProvider::new(settings));
+
+    let puter_provider = if let Some(ref creds) = settings.puter_api_key {
+        tracing::info!("Puter provider detected, initializing...");
+        match crate::providers::PuterProvider::new(creds, settings).await {
+            Ok(pp) => {
+                tracing::info!("Puter provider ready");
+                Some(Arc::new(pp))
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize Puter provider: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let kimi_oauth_provider = if settings.kimi_oauth_enable {
+        tracing::info!("Kimi OAuth provider detected, initializing...");
+        match crate::providers::kimi_oauth::bootstrap_if_enabled(settings).await {
+            Ok(Some(p)) => {
+                tracing::info!("Kimi OAuth provider ready");
+                Some(p)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!("Failed to initialize Kimi OAuth: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let cloudflare_provider = if settings.cloudflare_api_key.is_some() {
+        tracing::info!("Cloudflare provider detected, initializing...");
+        Some(Arc::new(crate::providers::CloudflareProvider::new(
+            settings,
+        )))
+    } else {
+        None
+    };
+
+    ProviderBundle {
+        provider,
+        puter_provider,
+        kimi_oauth_provider,
+        cloudflare_provider,
+    }
+}
+
+impl AppState {
+    pub async fn rebuild_providers(&self, settings: &Settings) {
+        let bundle = build_provider_bundle(settings).await;
+        *self.provider.write().await = bundle.provider;
+        *self.puter_provider.write().await = bundle.puter_provider;
+        *self.kimi_oauth_provider.write().await = bundle.kimi_oauth_provider;
+        *self.cloudflare_provider.write().await = bundle.cloudflare_provider;
+        tracing::info!("Provider runtime reloaded");
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -56,8 +129,10 @@ pub async fn create_message(
     axum::extract::Json(mut request): axum::extract::Json<MessagesRequest>,
 ) -> Response {
     trace!(
-        "Incoming request payload: {}",
-        serde_json::to_string(&request).unwrap_or_default()
+        "Incoming request: model={} messages={} tools={}",
+        request.model,
+        request.messages.len(),
+        request.tools.as_ref().map_or(0, Vec::len)
     );
     let settings = state.settings.load();
     if let Err(r) = check_auth(&headers, &settings) {
@@ -70,6 +145,20 @@ pub async fn create_message(
             Json(json!({
                 "type": "error",
                 "error": {"type": "invalid_request_error", "message": "messages cannot be empty"}
+            })),
+        )
+            .into_response();
+    }
+
+    if request_has_images(&request) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "image content blocks are not supported by this OpenAI-compatible proxy path yet"
+                }
             })),
         )
             .into_response();
@@ -101,8 +190,10 @@ pub async fn create_message(
                     "RTK applied: system prompt compacted from {} to {} chars",
                     orig_len, new_len
                 );
-                trace!("Original system prompt:\n{}", sys_text);
-                trace!("Transformed system prompt:\n{}", transformed);
+                trace!(
+                    "System prompt transformed: original_chars={} transformed_chars={}",
+                    orig_len, new_len
+                );
             }
 
             request.system = Some(SystemPrompt::Text(transformed));
@@ -124,7 +215,8 @@ pub async fn create_message(
         .unwrap_or("");
 
     if provider_type == "puter" {
-        if let Some(ref pp) = state.puter_provider {
+        let puter_provider = state.puter_provider.read().await.clone();
+        if let Some(ref pp) = puter_provider {
             if request.stream == Some(false) {
                 let result = pp
                     .send_non_streaming(&request, input_tokens, &request_id)
@@ -161,14 +253,15 @@ pub async fn create_message(
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": "Puter provider not enabled. Set PUTER_API_KEY to enable."
+                        "message": "Puter provider not enabled. Add a Puter key in the panel config."
                     }
                 })),
             )
                 .into_response();
         }
     } else if provider_type == "kimi_oauth" {
-        if let Some(ref kimi_provider) = state.kimi_oauth_provider {
+        let kimi_oauth_provider = state.kimi_oauth_provider.read().await.clone();
+        if let Some(ref kimi_provider) = kimi_oauth_provider {
             if request.stream == Some(false) {
                 let result = kimi_provider
                     .send_non_streaming(&request, input_tokens, &request_id)
@@ -205,14 +298,15 @@ pub async fn create_message(
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": "Kimi OAuth provider not enabled. Set KIMI_OAUTH_ENABLE=true."
+                        "message": "Kimi OAuth provider not enabled. Add a Kimi OAuth key in the panel config."
                     }
                 })),
             )
                 .into_response();
         }
     } else if provider_type == "cloudflare" {
-        if let Some(ref cloudflare_provider) = state.cloudflare_provider {
+        let cloudflare_provider = state.cloudflare_provider.read().await.clone();
+        if let Some(ref cloudflare_provider) = cloudflare_provider {
             if request.stream == Some(false) {
                 let result = cloudflare_provider
                     .send_non_streaming(
@@ -261,7 +355,7 @@ pub async fn create_message(
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": "Cloudflare provider not enabled. Set CLOUDFLARE_API_KEY to enable."
+                        "message": "Cloudflare provider not enabled. Add a Cloudflare account_id:api_token key in the panel config."
                     }
                 })),
             )
@@ -271,8 +365,8 @@ pub async fn create_message(
 
     // Non-streaming path (fallback — only when client explicitly sets stream: false)
     if request.stream == Some(false) {
-        let result = state
-            .provider
+        let provider = state.provider.read().await.clone();
+        let result = provider
             .send_non_streaming(
                 &request,
                 input_tokens,
@@ -295,7 +389,8 @@ pub async fn create_message(
     }
 
     // Default: SSE streaming path
-    let stream = state.provider.stream_response(
+    let provider = state.provider.read().await.clone();
+    let stream = provider.stream_response(
         &request,
         input_tokens,
         &request_id,
@@ -354,19 +449,19 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let config = state.panel_config.load();
     let provider_type = Settings::parse_provider_type(&settings.model);
 
-    let puter_status = if state.puter_provider.is_some() {
+    let puter_status = if state.puter_provider.read().await.is_some() {
         "enabled"
     } else {
         "disabled"
     };
 
-    let kimi_status = if state.kimi_oauth_provider.is_some() {
+    let kimi_status = if state.kimi_oauth_provider.read().await.is_some() {
         "enabled"
     } else {
         "disabled"
     };
 
-    let cloudflare_status = if state.cloudflare_provider.is_some() {
+    let cloudflare_status = if state.cloudflare_provider.read().await.is_some() {
         "enabled"
     } else {
         "disabled"
@@ -402,4 +497,13 @@ pub async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
         "model": settings.model,
     }))
     .into_response()
+}
+
+fn request_has_images(request: &MessagesRequest) -> bool {
+    request.messages.iter().any(|msg| match &msg.content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. })),
+        MessageContent::Text(_) => false,
+    })
 }

@@ -177,13 +177,22 @@ impl KeyPool {
     }
 
     /// Report a successful request — resets error counter and cooldown escalation.
-    pub fn report_success(&self, endpoint: &KeyEndpoint, latency_ms: u64) {
-        endpoint.consecutive_errors.store(0, Ordering::Relaxed);
-        endpoint.cooldown_count.store(0, Ordering::Relaxed);
-        endpoint.healthy.store(true, Ordering::Relaxed);
+    pub async fn report_success(&self, endpoint: &KeyEndpoint, latency_ms: u64) {
         endpoint
             .last_latency_ms
             .store(latency_ms, Ordering::Relaxed);
+
+        let cooldown_active = {
+            let lock = endpoint.cooldown_until.lock().await;
+            lock.is_some_and(|until| Instant::now() < until)
+        };
+        if cooldown_active {
+            return;
+        }
+
+        endpoint.consecutive_errors.store(0, Ordering::Relaxed);
+        endpoint.cooldown_count.store(0, Ordering::Relaxed);
+        endpoint.healthy.store(true, Ordering::Relaxed);
     }
 
     /// Report an error — increments counter, may trigger cooldown.
@@ -317,7 +326,7 @@ impl KeyPoolManager {
     pub async fn report_success(&self, endpoint: &KeyEndpoint, latency_ms: u64) {
         let pools = self.pools.read().await;
         if let Some(pool) = pools.get(&endpoint.provider) {
-            pool.report_success(endpoint, latency_ms);
+            pool.report_success(endpoint, latency_ms).await;
         }
     }
 
@@ -336,6 +345,10 @@ impl KeyPoolManager {
             Some(pool) => pool.all_exhausted().await,
             None => true, // No pool = considered exhausted
         }
+    }
+
+    pub async fn has_pool(&self, provider: &str) -> bool {
+        self.pools.read().await.contains_key(provider)
     }
 
     /// Reload pools from a new profile config.
@@ -393,10 +406,21 @@ impl KeyPoolManager {
 
 /// Mask a key for display: show first 3 + "..." + last 3 chars.
 pub fn mask_key(key: &str) -> String {
-    if key.len() <= 8 {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
         "***".to_string()
     } else {
-        format!("{}...{}", &key[..3], &key[key.len() - 3..])
+        let prefix: String = chars.iter().take(3).copied().collect();
+        let suffix: String = chars
+            .iter()
+            .rev()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{}...{}", prefix, suffix)
     }
 }
 

@@ -13,10 +13,6 @@ pub fn oauth_host() -> String {
     env::var("KIMI_OAUTH_HOST").unwrap_or_else(|_| "https://auth.kimi.com".to_string())
 }
 
-pub fn api_base_url() -> String {
-    env::var("KIMI_OAUTH_BASE_URL").unwrap_or_else(|_| "https://api.kimi.com/coding/v1".to_string())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredAuth {
     pub access: String,

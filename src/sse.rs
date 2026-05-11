@@ -7,6 +7,7 @@ pub struct ToolCallState {
     pub name: String,
     pub contents: Vec<String>,
     pub started: bool,
+    pub emitted_input: bool,
 }
 
 pub struct ContentBlockManager {
@@ -53,6 +54,7 @@ impl ContentBlockManager {
                     name: name.to_string(),
                     contents: Vec::new(),
                     started: false,
+                    emitted_input: false,
                 },
             );
         }
@@ -272,6 +274,7 @@ impl SSEBuilder {
                     name: name.to_string(),
                     contents: Vec::new(),
                     started: true,
+                    emitted_input: false,
                 },
             );
         }
@@ -287,8 +290,46 @@ impl SSEBuilder {
             .unwrap_or(0);
         if let Some(state) = self.blocks.tool_states.get_mut(&tool_index) {
             state.contents.push(partial_json.to_string());
+            state.emitted_input = true;
         }
         self.content_block_delta(block_idx as u32, "input_json_delta", partial_json)
+    }
+
+    pub fn flush_task_tool_inputs(&mut self) -> Vec<String> {
+        let pending: Vec<(i32, u32, String)> = self
+            .blocks
+            .tool_states
+            .iter()
+            .filter_map(|(tool_index, state)| {
+                if state.started && state.name == "Task" && !state.emitted_input {
+                    Some((
+                        *tool_index,
+                        state.block_index as u32,
+                        state.contents.join(""),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut events = Vec::with_capacity(pending.len());
+        for (tool_index, block_idx, accumulated) in pending {
+            let partial_json =
+                crate::heuristic_tool_parser::task_arguments_with_foreground(&accumulated)
+                    .unwrap_or_else(|| {
+                        if accumulated.trim().is_empty() {
+                            r#"{"run_in_background":false}"#.to_string()
+                        } else {
+                            accumulated
+                        }
+                    });
+            if let Some(state) = self.blocks.tool_states.get_mut(&tool_index) {
+                state.emitted_input = true;
+            }
+            events.push(self.content_block_delta(block_idx, "input_json_delta", &partial_json));
+        }
+        events
     }
 
     pub fn emit_error(&mut self, error_message: &str) -> Vec<String> {

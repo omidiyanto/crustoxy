@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 
 use crate::panel_config::{PanelConfig, ProfileConfig};
@@ -5,144 +6,116 @@ use crate::panel_config::{PanelConfig, ProfileConfig};
 #[derive(Clone, Debug)]
 pub struct ProviderDef {
     pub name: &'static str,
-    pub env_prefix: &'static str,
     pub default_base_url: &'static str,
 }
 
 pub const PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
         name: "openai",
-        env_prefix: "OPENAI",
         default_base_url: "https://api.openai.com/v1",
     },
     ProviderDef {
         name: "openrouter",
-        env_prefix: "OPENROUTER",
         default_base_url: "https://openrouter.ai/api/v1",
     },
     ProviderDef {
         name: "groq",
-        env_prefix: "GROQ",
         default_base_url: "https://api.groq.com/openai/v1",
     },
     ProviderDef {
         name: "deepseek",
-        env_prefix: "DEEPSEEK",
         default_base_url: "https://api.deepseek.com/v1",
     },
     ProviderDef {
         name: "gemini",
-        env_prefix: "GEMINI",
         default_base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
     },
     ProviderDef {
         name: "together",
-        env_prefix: "TOGETHER",
         default_base_url: "https://api.together.xyz/v1",
     },
     ProviderDef {
         name: "huggingface",
-        env_prefix: "HUGGINGFACE",
         default_base_url: "https://router.huggingface.co/v1",
     },
     ProviderDef {
         name: "mistral",
-        env_prefix: "MISTRAL",
         default_base_url: "https://api.mistral.ai/v1",
     },
     ProviderDef {
         name: "perplexity",
-        env_prefix: "PERPLEXITY",
         default_base_url: "https://api.perplexity.ai",
     },
     ProviderDef {
         name: "fireworks",
-        env_prefix: "FIREWORKS",
         default_base_url: "https://api.fireworks.ai/inference/v1",
     },
     ProviderDef {
         name: "deepinfra",
-        env_prefix: "DEEPINFRA",
         default_base_url: "https://api.deepinfra.com/v1/openai",
     },
     ProviderDef {
         name: "kimi",
-        env_prefix: "KIMI",
         default_base_url: "https://api.moonshot.cn/v1",
     },
     ProviderDef {
         name: "zhipu",
-        env_prefix: "ZHIPU",
         default_base_url: "https://open.bigmodel.cn/api/paas/v4",
     },
     ProviderDef {
         name: "anyscale",
-        env_prefix: "ANYSCALE",
         default_base_url: "https://api.endpoints.anyscale.com/v1",
     },
     ProviderDef {
         name: "siliconflow",
-        env_prefix: "SILICONFLOW",
         default_base_url: "https://api.siliconflow.com/v1",
     },
     ProviderDef {
         name: "novita",
-        env_prefix: "NOVITA",
         default_base_url: "https://api.novita.ai/openai",
     },
     ProviderDef {
         name: "nvidia_nim",
-        env_prefix: "NVIDIA_NIM",
         default_base_url: "https://integrate.api.nvidia.com/v1",
     },
     ProviderDef {
         name: "modal",
-        env_prefix: "MODAL",
         default_base_url: "https://api.modal.com/v1",
     },
     ProviderDef {
         name: "opencode_zen",
-        env_prefix: "OPENCODE_ZEN",
         default_base_url: "https://opencode.ai/zen/v1",
     },
     ProviderDef {
         name: "ollama",
-        env_prefix: "OLLAMA",
         default_base_url: "http://localhost:11434/v1",
     },
     ProviderDef {
         name: "lmstudio",
-        env_prefix: "LMSTUDIO",
         default_base_url: "http://localhost:1234/v1",
     },
     ProviderDef {
         name: "vllm",
-        env_prefix: "VLLM",
         default_base_url: "http://localhost:8000/v1",
     },
     ProviderDef {
         name: "llamacpp",
-        env_prefix: "LLAMACPP",
         default_base_url: "http://localhost:8080/v1",
     },
     ProviderDef {
         name: "kimi_oauth",
-        env_prefix: "KIMI_OAUTH",
         default_base_url: "https://api.kimi.com/coding/v1",
     },
     ProviderDef {
         name: "sumopod",
-        env_prefix: "SUMOPOD",
         default_base_url: "https://ai.sumopod.com/v1",
     },
     ProviderDef {
         name: "cloudflare",
-        env_prefix: "CLOUDFLARE",
         default_base_url: "https://api.cloudflare.com/client/v4/accounts",
     },
     ProviderDef {
         name: "custom",
-        env_prefix: "CUSTOM",
         default_base_url: "",
     },
 ];
@@ -183,6 +156,7 @@ pub struct Settings {
     pub puter_api_key: Option<String>,
     pub kimi_oauth_enable: bool,
     pub cloudflare_api_key: Option<String>,
+    pub provider_base_urls: HashMap<String, String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -214,19 +188,16 @@ impl Settings {
             .into_iter()
             .next();
 
-        // Special providers: check if keys exist in config
+        // Special providers: check if keys exist in config.
         let puter_key = profile.provider_keys.get("puter").cloned();
-        let kimi_oauth_enabled = profile.provider_keys.contains_key("kimi_oauth")
-            || env::var("KIMI_OAUTH_ENABLE")
-                .ok()
-                .is_some_and(|v| v == "true");
+        let kimi_oauth_enabled = profile.provider_keys.contains_key("kimi_oauth");
         let cloudflare_key = profile.provider_keys.get("cloudflare").and_then(|k| {
             let keys = k.split(';').next().map(|s| s.trim().to_string());
             keys.filter(|s| !s.is_empty())
         });
 
         Self {
-            host: env_or("HOST", "0.0.0.0"),
+            host: env_or("HOST", "127.0.0.1"),
             port: env_or("PORT", "8082").parse().unwrap_or(8082),
             anthropic_auth_token: env_or_none("ANTHROPIC_AUTH_TOKEN"),
             model: first_default,
@@ -251,7 +222,32 @@ impl Settings {
             puter_api_key: puter_key,
             kimi_oauth_enable: kimi_oauth_enabled,
             cloudflare_api_key: cloudflare_key,
+            provider_base_urls: profile.provider_base_urls.clone(),
         }
+    }
+
+    pub fn is_loopback_bind(&self) -> bool {
+        let host = self.host.trim().trim_matches(['[', ']']);
+        matches!(host, "127.0.0.1" | "localhost" | "::1")
+    }
+
+    pub fn validate_runtime_security(&self) -> Result<(), String> {
+        if self.anthropic_auth_token.is_none() && !self.is_loopback_bind() {
+            return Err(format!(
+                "ANTHROPIC_AUTH_TOKEN is required when HOST is '{}'. Bind to 127.0.0.1 for local unauthenticated setup, or set a token.",
+                self.host
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn provider_base_url(&self, provider_name: &str) -> String {
+        if let Some(url) = self.provider_base_urls.get(provider_name)
+            && !url.trim().is_empty()
+        {
+            return url.trim().to_string();
+        }
+        get_provider_default_base_url(provider_name)
     }
 
     /// Legacy constructor — kept for backward compat during migration.
@@ -316,23 +312,4 @@ pub fn get_provider_default_base_url(provider_name: &str) -> String {
         .find(|p| p.name == provider_name)
         .map(|d| d.default_base_url.to_string())
         .unwrap_or_default()
-}
-
-/// Legacy: get base URL from env vars (used by providers that haven't been migrated yet).
-pub fn get_provider_base_url(provider_name: &str) -> String {
-    let def = PROVIDERS.iter().find(|p| p.name == provider_name);
-    let prefix = def.map(|d| d.env_prefix).unwrap_or("CUSTOM");
-    let default_url = def.map(|d| d.default_base_url).unwrap_or("");
-
-    let key = format!("{}_BASE_URL", prefix);
-    env_or(&key, default_url)
-}
-
-/// Legacy: get API key from env vars (used by providers that haven't been migrated yet).
-pub fn get_provider_api_key(provider_name: &str) -> Option<String> {
-    let def = PROVIDERS.iter().find(|p| p.name == provider_name);
-    let prefix = def.map(|d| d.env_prefix).unwrap_or("CUSTOM");
-
-    let key = format!("{}_API_KEY", prefix);
-    env_or_none(&key)
 }

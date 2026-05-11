@@ -17,8 +17,9 @@ RUN apt-get update && \
 COPY --from=builder /build/target/release/crustoxy /usr/local/bin/crustoxy
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-ENV HOST=0.0.0.0
+ENV HOST=127.0.0.1
 ENV PORT=8082
-ENV KIMI_OAUTH_ENABLE=false
+ENV ANTHROPIC_AUTH_TOKEN=
+ENV CRUSTOXY_ENABLE_WARP=false
 EXPOSE 8082
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

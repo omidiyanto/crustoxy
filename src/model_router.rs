@@ -389,14 +389,15 @@ mod tests {
     use crate::panel_config::{ModelMapping, ProfileConfig};
 
     fn test_profile() -> ProfileConfig {
-        let mut p = ProfileConfig::default();
-        p.model_mapping = ModelMapping {
-            default: "openrouter/llama".to_string(),
-            opus: "nvidia_nim/model-a ; huggingface/model-b ; openrouter/model-c".to_string(),
-            sonnet: "groq/model-x".to_string(),
-            haiku: String::new(),
-        };
-        p
+        ProfileConfig {
+            model_mapping: ModelMapping {
+                default: "openrouter/llama".to_string(),
+                opus: "nvidia_nim/model-a ; huggingface/model-b ; openrouter/model-c".to_string(),
+                sonnet: "groq/model-x".to_string(),
+                haiku: String::new(),
+            },
+            ..Default::default()
+        }
     }
 
     #[test]

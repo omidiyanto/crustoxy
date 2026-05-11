@@ -60,7 +60,7 @@ pub struct ModelMapping {
 /// Feature flags controlling proxy optimizations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureFlags {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enable_ip_rotation: bool,
     #[serde(default = "default_true")]
     pub enable_network_probe_mock: bool,
@@ -223,7 +223,7 @@ impl Default for ModelMapping {
 impl Default for FeatureFlags {
     fn default() -> Self {
         Self {
-            enable_ip_rotation: true,
+            enable_ip_rotation: false,
             enable_network_probe_mock: true,
             enable_title_generation_skip: true,
             enable_suggestion_mode_skip: true,
@@ -334,18 +334,24 @@ impl PanelConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let content =
             std::fs::read_to_string(path).map_err(|e| format!("failed to read config: {e}"))?;
-        toml::from_str(&content).map_err(|e| format!("failed to parse config: {e}"))
+        let config: Self =
+            toml::from_str(&content).map_err(|e| format!("failed to parse config: {e}"))?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Save configuration to a TOML file, creating parent directories as needed.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create config directory: {e}"))?;
         }
         let content =
             toml::to_string_pretty(self).map_err(|e| format!("failed to serialize config: {e}"))?;
-        std::fs::write(path, content).map_err(|e| format!("failed to write config: {e}"))
+        let tmp_path = path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, content).map_err(|e| format!("failed to write config: {e}"))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| format!("failed to replace config: {e}"))
     }
 
     /// Get the default config file path: `~/.config/crustoxy/config.toml`
@@ -354,6 +360,117 @@ impl PanelConfig {
             .unwrap_or_else(|| PathBuf::from("/root/.config"))
             .join("crustoxy")
             .join("config.toml")
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.profiles.is_empty() {
+            return Err("config must contain at least one profile".to_string());
+        }
+        if !self.profiles.contains_key(&self.general.active_profile) {
+            return Err(format!(
+                "active profile '{}' does not exist",
+                self.general.active_profile
+            ));
+        }
+
+        for (key, profile) in &self.profiles {
+            if key.trim().is_empty() {
+                return Err("profile key cannot be empty".to_string());
+            }
+            if parse_model_list(&profile.model_mapping.default).is_empty() {
+                return Err(format!(
+                    "profile '{key}' must define at least one default model"
+                ));
+            }
+
+            validate_model_list(key, "default", &profile.model_mapping.default)?;
+            validate_model_list(key, "opus", &profile.model_mapping.opus)?;
+            validate_model_list(key, "sonnet", &profile.model_mapping.sonnet)?;
+            validate_model_list(key, "haiku", &profile.model_mapping.haiku)?;
+
+            if profile.rate_limiting.provider_rate_limit == 0 {
+                return Err(format!("profile '{key}' provider_rate_limit must be >= 1"));
+            }
+            if profile.rate_limiting.provider_rate_window == 0 {
+                return Err(format!("profile '{key}' provider_rate_window must be >= 1"));
+            }
+            if profile.rate_limiting.provider_max_concurrency == 0 {
+                return Err(format!(
+                    "profile '{key}' provider_max_concurrency must be >= 1"
+                ));
+            }
+            if profile.timeouts.http_read_timeout == 0 {
+                return Err(format!("profile '{key}' http_read_timeout must be >= 1"));
+            }
+            if profile.timeouts.http_connect_timeout == 0 {
+                return Err(format!("profile '{key}' http_connect_timeout must be >= 1"));
+            }
+            if profile.routing.health_recovery_interval == 0 {
+                return Err(format!(
+                    "profile '{key}' health_recovery_interval must be >= 1"
+                ));
+            }
+            if profile.routing.rate_limit_cooldown == 0 {
+                return Err(format!("profile '{key}' rate_limit_cooldown must be >= 1"));
+            }
+            if profile.routing.max_consecutive_errors == 0 {
+                return Err(format!(
+                    "profile '{key}' max_consecutive_errors must be >= 1"
+                ));
+            }
+            validate_strategy(key, "model_strategy", &profile.routing.model_strategy)?;
+            validate_strategy(key, "key_strategy", &profile.routing.key_strategy)?;
+
+            for (provider, url) in &profile.provider_base_urls {
+                let trimmed = url.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                    return Err(format!(
+                        "profile '{key}' provider '{provider}' base URL must start with http:// or https://"
+                    ));
+                }
+            }
+
+            if let Some(raw) = profile.provider_keys.get("cloudflare") {
+                for part in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    let Some((account_id, token)) = part.split_once(':') else {
+                        return Err(
+                            "cloudflare keys must use the format account_id:api_token".to_string()
+                        );
+                    };
+                    if account_id.trim().is_empty() || token.trim().is_empty() {
+                        return Err(
+                            "cloudflare keys must include non-empty account_id and api_token"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_model_list(profile: &str, tier: &str, raw: &str) -> Result<(), String> {
+    for spec in parse_model_list(raw) {
+        if spec.starts_with('/') || spec.ends_with('/') {
+            return Err(format!(
+                "profile '{profile}' tier '{tier}' has malformed model spec '{spec}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_strategy(profile: &str, field: &str, value: &str) -> Result<(), String> {
+    match value {
+        "round_robin" | "random" | "least_errors" => Ok(()),
+        other => Err(format!(
+            "profile '{profile}' {field} must be round_robin, random, or least_errors; got '{other}'"
+        )),
     }
 }
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {
@@ -20,6 +20,8 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<Value>,
+    #[serde(flatten)]
+    pub extra_body: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,4 +116,21 @@ pub struct ChunkUsage {
     pub prompt_tokens: Option<u32>,
     #[serde(default)]
     pub completion_tokens: Option<u32>,
+}
+
+pub fn parse_sse_data_line(line: &str) -> Option<&str> {
+    let payload = line.trim().strip_prefix("data:")?;
+    Some(payload.strip_prefix(' ').unwrap_or(payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_sse_data_line;
+
+    #[test]
+    fn parses_sse_data_with_or_without_space() {
+        assert_eq!(parse_sse_data_line("data: {\"x\":1}"), Some("{\"x\":1}"));
+        assert_eq!(parse_sse_data_line("data:{\"x\":1}"), Some("{\"x\":1}"));
+        assert_eq!(parse_sse_data_line(" event: message"), None);
+    }
 }

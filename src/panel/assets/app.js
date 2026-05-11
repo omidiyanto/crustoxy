@@ -9,10 +9,27 @@
   let config = null;
   let status = null;
   let currentPage = null;
+  let activeKeyProvider = null;
   let providers = [];
 
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => document.querySelectorAll(s);
+  const HTML_ESCAPE = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  };
+
+  const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => HTML_ESCAPE[ch]);
+  const escapeAttr = escapeHtml;
+  const safeNumber = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+
+  function normalizePage(page) {
+    if (page === "providers") return "keys";
+    return page || "dashboard";
+  }
 
   // ── API helpers ──────────────────────────────────────────────────────────
 
@@ -76,7 +93,7 @@
       ]);
       $("#version").textContent = "v" + (status.version || "?");
       updateProfileSelect();
-      renderPage(currentPage);
+      renderPage(currentPage || localStorage.getItem("crustoxy_page") || "dashboard", { force: true });
       updateStatusIndicator();
     } catch (e) {
       console.error("Load failed:", e);
@@ -154,15 +171,17 @@
 
   // ── Navigation ───────────────────────────────────────────────────────────
 
-  function renderPage(page) {
-    if (currentPage === page) return;
-    currentPage = page;
-    localStorage.setItem('crustoxy_page', page);
+  function renderPage(page, opts = {}) {
+    const nextPage = normalizePage(page);
+    if (currentPage === nextPage && !opts.force) return;
+    currentPage = nextPage;
+    if (nextPage !== "keys") activeKeyProvider = null;
+    localStorage.setItem('crustoxy_page', nextPage);
 
     $$(".nav-item").forEach((el) => {
-      el.classList.toggle("active", el.dataset.page === page);
+      el.classList.toggle("active", normalizePage(el.dataset.page) === nextPage);
     });
-    $("#page-title").textContent = pageTitle(page);
+    $("#page-title").textContent = pageTitle(nextPage);
     const c = $("#main-content");
     c.innerHTML = "";
     c.className = "main-content fade-in";
@@ -175,7 +194,7 @@
       profiles: renderProfiles,
       settings: renderSettings,
     };
-    (renderers[page] || renderDashboard)(c);
+    (renderers[nextPage] || renderDashboard)(c);
   }
 
   function pageTitle(p) {
@@ -191,6 +210,16 @@
     return map[p] || "Dashboard";
   }
 
+  function rerenderCurrentPage() {
+    const c = $("#main-content");
+    if (!c) return;
+    if (currentPage === "keys" && activeKeyProvider) {
+      renderProviderDetails(c, activeKeyProvider);
+      return;
+    }
+    renderPage(currentPage || "dashboard", { force: true });
+  }
+
   // ── Dashboard ────────────────────────────────────────────────────────────
 
   function renderDashboard(c) {
@@ -199,7 +228,7 @@
 
     const keyCount = Object.values(p.provider_keys || {}).reduce((s, v) => s + v.split(";").filter((x) => x.trim()).length, 0);
     const modelCount = ["default", "opus", "sonnet", "haiku"].reduce((s, t) => {
-      const v = p.model_mapping[t] || "";
+      const v = (p.model_mapping && p.model_mapping[t]) || "";
       return s + v.split(";").filter((x) => x.trim()).length;
     }, 0);
 
@@ -207,7 +236,7 @@
       <div class="dashboard-grid">
         <div class="stat-card">
           <div class="stat-label">ACTIVE PROFILE</div>
-          <div class="stat-value">${p.name || "Default"}</div>
+          <div class="stat-value">${escapeHtml(p.name || "Default")}</div>
         </div>
         <div class="stat-card">
           <div class="stat-label">TOTAL MODELS</div>
@@ -241,7 +270,7 @@
       for (const k of keys) {
         const cls = k.on_cooldown ? "cooldown" : k.healthy ? "healthy" : "unhealthy";
         const label = k.on_cooldown ? "COOLDOWN" : k.healthy ? "HEALTHY" : "DOWN";
-        html += `<tr><td>${prov}</td><td>${k.key_preview}</td><td><span class="status-dot ${cls}"></span>${label}</td><td>${k.total_requests}</td><td>${k.total_errors}</td></tr>`;
+        html += `<tr><td>${escapeHtml(prov)}</td><td>${escapeHtml(k.key_preview)}</td><td><span class="status-dot ${cls}"></span>${label}</td><td>${safeNumber(k.total_requests)}</td><td>${safeNumber(k.total_errors)}</td></tr>`;
       }
     }
     html += "</table></div>";
@@ -258,7 +287,7 @@
       for (const m of models) {
         const cls = m.on_cooldown ? "cooldown" : m.healthy ? "healthy" : "unhealthy";
         const label = m.on_cooldown ? "COOLDOWN" : m.healthy ? "READY" : "DOWN";
-        html += `<tr><td style="text-transform:uppercase">${tier}</td><td>${m.provider}</td><td>${m.model_name}</td><td><span class="status-dot ${cls}"></span>${label}</td></tr>`;
+        html += `<tr><td style="text-transform:uppercase">${escapeHtml(tier)}</td><td>${escapeHtml(m.provider)}</td><td>${escapeHtml(m.model_name)}</td><td><span class="status-dot ${cls}"></span>${label}</td></tr>`;
       }
     }
     html += "</table></div>";
@@ -276,12 +305,12 @@
     html += '<div class="dashboard-grid">';
 
     for (const tier of tiers) {
-      const models = (p.model_mapping[tier] || "").split(";").filter(s => s.trim());
+      const models = ((p.model_mapping && p.model_mapping[tier]) || "").split(";").filter(s => s.trim());
       html += `
         <div class="stat-card" style="display:flex; flex-direction:column; justify-content:space-between">
           <div>
             <div class="stat-label">${tier === "default" ? "DEFAULT (FALLBACK)" : tier}</div>
-            <div class="stat-value">${models.length}</div>
+            <div class="stat-value">${safeNumber(models.length)}</div>
             <div class="stat-sub">models configured</div>
           </div>
           <button class="btn btn-sm btn-prov-cfg" style="margin-top:16px" data-tier="${tier}">OPEN</button>
@@ -300,7 +329,7 @@
 
   function renderTierDetails(c, tier) {
     const p = activeProfile();
-    const rawVal = p.model_mapping[tier] || "";
+    const rawVal = (p.model_mapping && p.model_mapping[tier]) || "";
     const models = rawVal.split(";").map(s => s.trim()).filter(Boolean);
 
     let html = `<div style="margin-bottom: 16px; display:flex; justify-content:space-between; align-items:center;">
@@ -313,7 +342,7 @@
         <!-- Left node (Tier) -->
         <div style="padding:16px 24px; background:var(--surface-raised); border:1px solid var(--accent); border-radius:8px; text-align:center; z-index:2; min-width:140px;">
           <div style="font-family:'Space Mono',monospace; font-size:11px; color:var(--text-secondary); margin-bottom:4px;">ROUTING TIER</div>
-          <div style="font-size:18px; font-weight:500; color:var(--text-display); text-transform:uppercase;">${tier === "default" ? "DEFAULT" : tier}</div>
+          <div style="font-size:18px; font-weight:500; color:var(--text-display); text-transform:uppercase;">${escapeHtml(tier === "default" ? "DEFAULT" : tier)}</div>
         </div>
         
         <!-- Center connector line -->
@@ -344,10 +373,10 @@
             <div style="width:20px; height:2px; background:var(--border-visible);"></div>
             <div style="padding:12px 16px; background:var(--surface-raised); border:1px solid var(--border); border-radius:8px; width: 280px; transition:border-color 0.2s;">
               <div style="font-family:'Space Mono',monospace; font-size:11px; color:var(--text-secondary); margin-bottom:4px; display:flex; align-items:center; justify-content:space-between;">
-                <span>${prov.toUpperCase()}</span>
+                <span>${escapeHtml(prov.toUpperCase())}</span>
                 ${keyWarning}
               </div>
-              <div style="font-family:'Space Mono',monospace; font-size:13px; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${modelName}">${modelName}</div>
+              <div style="font-family:'Space Mono',monospace; font-size:13px; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${escapeAttr(modelName)}">${escapeHtml(modelName)}</div>
             </div>
           </div>
         `;
@@ -363,12 +392,12 @@
 
     $("#back-to-models").addEventListener("click", () => renderModels(c));
     $("#cfg-tier").addEventListener("click", () => {
-      const val = (p.model_mapping[tier] || "").split(";").map(s => s.trim()).filter(Boolean).join("\n");
+      const val = ((p.model_mapping && p.model_mapping[tier]) || "").split(";").map(s => s.trim()).filter(Boolean).join("\n");
 
       const modalHtml = `
         <div class="form-group">
           <label class="form-label">MODELS (one per line)</label>
-          <textarea id="modal-tier-models" class="form-textarea" rows="6" placeholder="provider/model\\nprovider/model">${val}</textarea>
+          <textarea id="modal-tier-models" class="form-textarea" rows="6" placeholder="provider/model\\nprovider/model">${escapeHtml(val)}</textarea>
           <div class="form-hint" style="margin-top:8px">Order determines routing priority (top to bottom).</div>
         </div>
         <button id="modal-tier-save" class="btn btn-primary" style="width:100%">SAVE MAPPING</button>
@@ -377,6 +406,7 @@
       openModal("Configure " + tier.toUpperCase() + " Tier", modalHtml, () => {
         $("#modal-tier-save").addEventListener("click", async () => {
           const newVal = $("#modal-tier-models").value.split("\n").map(s => s.trim()).filter(Boolean).join(" ; ");
+          if (!p.model_mapping) p.model_mapping = {};
           p.model_mapping[tier] = newVal;
           closeModal();
           await saveConfig();
@@ -391,6 +421,7 @@
   function renderKeys(c) {
     const p = activeProfile();
     if (!p) return;
+    activeKeyProvider = null;
     let html = `<div class="form-hint" style="margin-bottom:16px">Configure API key pools per provider. Multiple keys enable load-balanced rotation.</div>
       <div class="card">
         <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
@@ -413,22 +444,24 @@
     const p = activeProfile();
 
     const sortedProvs = [...providers].sort((a, b) => {
-      if (a.name.toLowerCase() === "custom") return -1;
-      if (b.name.toLowerCase() === "custom") return 1;
-      return a.name.localeCompare(b.name);
+      const aName = String(a.name || "");
+      const bName = String(b.name || "");
+      if (aName.toLowerCase() === "custom") return -1;
+      if (bName.toLowerCase() === "custom") return 1;
+      return aName.localeCompare(bName);
     });
 
     let html = '<div class="table-wrap"><table><tr><th>Provider</th><th>Keys Configured</th><th></th></tr>';
     let countMatch = 0;
 
     for (const pr of sortedProvs) {
-      if (searchQuery && !pr.name.toLowerCase().includes(searchQuery)) continue;
+      const prov = String(pr.name || "");
+      if (searchQuery && !prov.toLowerCase().includes(searchQuery)) continue;
       countMatch++;
 
-      const prov = pr.name;
-      const rawKeys = p.provider_keys[prov] || "";
+      const rawKeys = (p.provider_keys && p.provider_keys[prov]) || "";
       const count = rawKeys.split(";").filter((x) => x.trim()).length;
-      html += `<tr><td>${prov}</td><td>${count} key(s)</td><td style="text-align:right"><button class="btn btn-sm btn-prov-cfg" data-prov="${prov}">CONFIGURE</button></td></tr>`;
+      html += `<tr><td>${escapeHtml(prov)}</td><td>${safeNumber(count)} key(s)</td><td style="text-align:right"><button class="btn btn-sm btn-prov-cfg" data-prov="${escapeAttr(prov)}">CONFIGURE</button></td></tr>`;
     }
 
     if (countMatch === 0) {
@@ -447,9 +480,10 @@
 
   function renderProviderDetails(c, prov) {
     const p = activeProfile();
+    activeKeyProvider = prov;
     const providerObj = providers.find(x => x.name === prov) || { default_base_url: "" };
-    const existingUrl = p.provider_base_urls[prov] || "";
-    const rawKeys = p.provider_keys[prov] || "";
+    const existingUrl = (p.provider_base_urls && p.provider_base_urls[prov]) || "";
+    const rawKeys = (p.provider_keys && p.provider_keys[prov]) || "";
     const keysArray = rawKeys.split(";").map(s => s.trim()).filter(Boolean);
 
     let html = `<div style="margin-bottom: 16px; display:flex; justify-content:space-between; align-items:center;">
@@ -457,11 +491,11 @@
     </div>`;
 
     html += `
-      <div class="card"><div class="card-header"><div class="card-title">${prov.toUpperCase()} SETTINGS</div></div>
+      <div class="card"><div class="card-header"><div class="card-title">${escapeHtml(prov.toUpperCase())} SETTINGS</div></div>
         <div class="form-group" style="margin-bottom:0">
           <label class="form-label">BASE URL OVERRIDE</label>
           <div style="display:flex;gap:8px">
-            <input id="prov-url" class="form-input" placeholder="${providerObj.default_base_url || 'https://...'}" value="${existingUrl}" style="flex:1">
+            <input id="prov-url" class="form-input" placeholder="${escapeAttr(providerObj.default_base_url || 'https://...')}" value="${escapeAttr(existingUrl)}" style="flex:1">
             <button id="save-prov-url" class="btn btn-sm">SAVE URL</button>
           </div>
           <div class="form-hint" style="margin-top:8px">Leave empty to use default. Save immediately to apply.</div>
@@ -500,10 +534,10 @@
 
         html += `
           <tr>
-            <td style="font-family:'Space Mono',monospace;">${displayKey}</td>
+            <td style="font-family:'Space Mono',monospace;">${escapeHtml(displayKey)}</td>
             <td><span class="status-dot ${statCls}"></span>${statLabel}</td>
-            <td>${kStats.total_requests}</td>
-            <td>${kStats.total_errors}</td>
+            <td>${safeNumber(kStats.total_requests)}</td>
+            <td>${safeNumber(kStats.total_errors)}</td>
             <td style="text-align:right"><button class="btn btn-sm del-key-btn" data-idx="${idx}" style="color:var(--error);border-color:transparent;background:transparent">✕</button></td>
           </tr>
         `;
@@ -532,6 +566,7 @@
 
     $("#save-prov-url").addEventListener("click", async () => {
       const u = $("#prov-url").value.trim();
+      if (!p.provider_base_urls) p.provider_base_urls = {};
       if (u) p.provider_base_urls[prov] = u;
       else delete p.provider_base_urls[prov];
       await saveConfig();
@@ -550,6 +585,7 @@
     $("#add-key-btn").addEventListener("click", async () => {
       const nk = $("#new-key-val").value.trim();
       if (nk) {
+        if (!p.provider_keys) p.provider_keys = {};
         keysArray.push(nk);
         p.provider_keys[prov] = keysArray.join(" ; ");
         await saveConfig();
@@ -562,8 +598,9 @@
         const idx = parseInt(btn.dataset.idx);
         keysArray.splice(idx, 1);
         if (keysArray.length > 0) {
+          if (!p.provider_keys) p.provider_keys = {};
           p.provider_keys[prov] = keysArray.join(" ; ");
-        } else {
+        } else if (p.provider_keys) {
           delete p.provider_keys[prov];
         }
         await saveConfig();
@@ -597,11 +634,11 @@
       </div>`;
     }
     html += `<div class="card"><div class="card-header"><div class="card-title">TOOL RETRY MAX</div></div>
-      <input class="form-input" type="number" id="tool-retry-max" value="${f.tool_retry_max || 2}" min="0" max="10" style="width:100px">
+      <input class="form-input" type="number" id="tool-retry-max" value="${safeNumber(f.tool_retry_max || 2)}" min="0" max="10" style="width:100px">
     </div>`;
     html += `<div class="card"><div class="card-header"><div class="card-title">SYSTEM PROMPT OVERRIDE</div></div>
       <div class="form-group" style="margin-bottom:0">
-        <textarea id="override-sys-prompt" class="form-textarea" rows="4" placeholder="Leave empty to use Claude's default system prompt.">${f.override_system_prompt || ""}</textarea>
+        <textarea id="override-sys-prompt" class="form-textarea" rows="4" placeholder="Leave empty to use Claude's default system prompt.">${escapeHtml(f.override_system_prompt || "")}</textarea>
         <div class="form-hint" style="margin-top:8px">Overrides the default system prompt sent to the LLM. Applies globally to this profile.</div>
       </div>
     </div>`;
@@ -636,13 +673,13 @@
       </div>
       <div class="dashboard-grid">
         <div class="card"><div class="card-header"><div class="card-title">RATE LIMIT COOLDOWN (s)</div></div>
-          <input class="form-input" type="number" id="r-cooldown" value="${r.rate_limit_cooldown}" min="5">
+          <input class="form-input" type="number" id="r-cooldown" value="${safeNumber(r.rate_limit_cooldown)}" min="5">
         </div>
         <div class="card"><div class="card-header"><div class="card-title">MAX CONSECUTIVE ERRORS</div></div>
-          <input class="form-input" type="number" id="r-maxerr" value="${r.max_consecutive_errors}" min="1">
+          <input class="form-input" type="number" id="r-maxerr" value="${safeNumber(r.max_consecutive_errors)}" min="1">
         </div>
         <div class="card"><div class="card-header"><div class="card-title">HEALTH RECOVERY (s)</div></div>
-          <input class="form-input" type="number" id="r-recovery" value="${r.health_recovery_interval}" min="10">
+          <input class="form-input" type="number" id="r-recovery" value="${safeNumber(r.health_recovery_interval)}" min="10">
         </div>
       </div>`;
 
@@ -692,13 +729,16 @@
     let html = '<div class="table-wrap"><table><tr><th>Key</th><th>Name</th><th>Status</th><th></th></tr>';
     for (const [key, prof] of Object.entries(config.profiles)) {
       const isActive = key === config.general.active_profile;
+      const safeKey = escapeHtml(key);
+      const attrKey = escapeAttr(key);
+      const safeName = escapeHtml(prof.name);
       html += `<tr>
-        <td>${key}</td><td>${prof.name}</td>
-        <td>${isActive ? '<span style="color:var(--success)">● ACTIVE</span>' : '<button class="btn btn-sm prof-activate" data-key="' + key + '">ACTIVATE</button>'}</td>
+        <td>${safeKey}</td><td>${safeName}</td>
+        <td>${isActive ? '<span style="color:var(--success)">● ACTIVE</span>' : '<button class="btn btn-sm prof-activate" data-key="' + attrKey + '">ACTIVATE</button>'}</td>
         <td style="text-align:right">
-          <button class="btn btn-sm prof-rename" data-key="${key}" title="Rename Profile">✎ RENAME</button>
-          <button class="btn btn-sm prof-duplicate" data-key="${key}" title="Duplicate Profile">⧉ DUP</button>
-          ${!isActive ? `<button class="btn btn-sm prof-delete" data-key="${key}" style="color:var(--error);border-color:transparent" title="Delete Profile">✕</button>` : ""}
+          <button class="btn btn-sm prof-rename" data-key="${attrKey}" title="Rename Profile">✎ RENAME</button>
+          <button class="btn btn-sm prof-duplicate" data-key="${attrKey}" title="Duplicate Profile">⧉ DUP</button>
+          ${!isActive ? `<button class="btn btn-sm prof-delete" data-key="${attrKey}" style="color:var(--error);border-color:transparent" title="Delete Profile">✕</button>` : ""}
         </td>
       </tr>`;
     }
@@ -707,7 +747,7 @@
 
     el.querySelectorAll(".prof-activate").forEach((btn) => {
       btn.addEventListener("click", async () => {
-        await api("POST", "/profiles/" + btn.dataset.key + "/activate");
+        await api("POST", "/profiles/" + encodeURIComponent(btn.dataset.key) + "/activate");
         await loadAll();
       });
     });
@@ -715,7 +755,7 @@
     el.querySelectorAll(".prof-delete").forEach((btn) => {
       btn.addEventListener("click", async () => {
         if (!confirm("Are you sure you want to delete this profile?")) return;
-        await api("DELETE", "/profiles/" + btn.dataset.key);
+        await api("DELETE", "/profiles/" + encodeURIComponent(btn.dataset.key));
         await loadAll();
       });
     });
@@ -728,7 +768,7 @@
         const modalHtml = `
           <div class="form-group">
             <label class="form-label">NEW PROFILE NAME</label>
-            <input id="modal-rename-name" class="form-input" value="${prof.name}">
+            <input id="modal-rename-name" class="form-input" value="${escapeAttr(prof.name)}">
           </div>
           <button id="modal-rename-save" class="btn btn-primary" style="width:100%">RENAME</button>
         `;
@@ -785,7 +825,7 @@
         const modalHtml = `
           <div class="form-group">
             <label class="form-label">NEW PROFILE NAME</label>
-            <input id="modal-dup-name" class="form-input" value="${prof.name} (Copy)">
+            <input id="modal-dup-name" class="form-input" value="${escapeAttr((prof.name || "") + " (Copy)")}">
           </div>
           <button id="modal-dup-save" class="btn btn-primary" style="width:100%">DUPLICATE</button>
         `;
@@ -828,19 +868,19 @@
       <div class="card"><div class="card-header"><div class="card-title">RATE LIMITING</div></div>
         <div class="dashboard-grid">
           <div class="form-group"><label class="form-label">REQUESTS PER WINDOW</label>
-            <input class="form-input" type="number" id="s-ratelimit" value="${rl.provider_rate_limit}"></div>
+            <input class="form-input" type="number" id="s-ratelimit" value="${safeNumber(rl.provider_rate_limit)}"></div>
           <div class="form-group"><label class="form-label">WINDOW (SECONDS)</label>
-            <input class="form-input" type="number" id="s-ratewindow" value="${rl.provider_rate_window}"></div>
+            <input class="form-input" type="number" id="s-ratewindow" value="${safeNumber(rl.provider_rate_window)}"></div>
           <div class="form-group"><label class="form-label">MAX CONCURRENCY</label>
-            <input class="form-input" type="number" id="s-maxconc" value="${rl.provider_max_concurrency}"></div>
+            <input class="form-input" type="number" id="s-maxconc" value="${safeNumber(rl.provider_max_concurrency)}"></div>
         </div>
       </div>
       <div class="card"><div class="card-header"><div class="card-title">TIMEOUTS</div></div>
         <div class="dashboard-grid">
           <div class="form-group"><label class="form-label">READ TIMEOUT (s)</label>
-            <input class="form-input" type="number" id="s-readto" value="${to.http_read_timeout}"></div>
+            <input class="form-input" type="number" id="s-readto" value="${safeNumber(to.http_read_timeout)}"></div>
           <div class="form-group"><label class="form-label">CONNECT TIMEOUT (s)</label>
-            <input class="form-input" type="number" id="s-connto" value="${to.http_connect_timeout}"></div>
+            <input class="form-input" type="number" id="s-connto" value="${safeNumber(to.http_connect_timeout)}"></div>
         </div>
       </div>`;
 
@@ -867,7 +907,7 @@
       updateProfileSelect();
       showApp();
       const lastPage = localStorage.getItem('crustoxy_page') || "dashboard";
-      renderPage(lastPage);
+      renderPage(lastPage, { force: true });
       updateStatusIndicator();
     } catch {
       // Needs auth
@@ -905,8 +945,8 @@
       try {
         status = await api("GET", "/status");
         updateStatusIndicator();
-        if (currentPage === "dashboard" || currentPage === "providers") {
-          renderPage(currentPage);
+        if (currentPage === "dashboard" || currentPage === "keys") {
+          rerenderCurrentPage();
         }
       } catch { /* ignore */ }
     }, 10000);

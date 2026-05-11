@@ -71,17 +71,34 @@ pub async fn get_config(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         return r;
     }
     let config = state.panel_config.load();
-    Json(json!(**config)).into_response()
+    Json(json!(masked_config(&config))).into_response()
 }
 
 /// PUT /api/config — Update entire configuration.
 pub async fn update_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(new_config): Json<PanelConfig>,
+    Json(mut new_config): Json<PanelConfig>,
 ) -> Response {
     if let Err(r) = check_panel_auth(&headers, &state) {
         return r;
+    }
+
+    let current = state.panel_config.load();
+    preserve_masked_provider_keys(&mut new_config, &current);
+    if let Err(e) = new_config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid config: {}", e)})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate_runtime_settings(&new_config) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid runtime config: {}", e)})),
+        )
+            .into_response();
     }
 
     // Save to disk
@@ -95,7 +112,13 @@ pub async fn update_config(
     }
 
     // Apply immediately (hot-reload)
-    apply_config(&state, new_config).await;
+    if let Err(e) = apply_config(&state, new_config).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Failed to apply config: {}", e)})),
+        )
+            .into_response();
+    }
 
     info!("Config updated via panel API");
     Json(json!({"status": "applied"})).into_response()
@@ -161,7 +184,7 @@ pub async fn update_profile(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Json(profile): Json<ProfileConfig>,
+    Json(mut profile): Json<ProfileConfig>,
 ) -> Response {
     if let Err(r) = check_panel_auth(&headers, &state) {
         return r;
@@ -175,6 +198,10 @@ pub async fn update_profile(
             Json(json!({"error": "Profile not found"})),
         )
             .into_response();
+    }
+
+    if let Some(current_profile) = config.profiles.get(&name) {
+        preserve_masked_keys_for_profile(&mut profile, current_profile);
     }
 
     config.profiles.insert(name, profile);
@@ -281,7 +308,13 @@ pub async fn trigger_restart(State(state): State<Arc<AppState>>, headers: Header
     let config_path = crate::config_loader::config_path();
     match PanelConfig::load(&config_path) {
         Ok(config) => {
-            apply_config(&state, config).await;
+            if let Err(e) = apply_config(&state, config).await {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("Failed to apply config: {}", e)})),
+                )
+                    .into_response();
+            }
             info!("Configuration reloaded via panel restart");
             Json(json!({"status": "restarted"})).into_response()
         }
@@ -316,6 +349,21 @@ pub async fn list_providers(State(state): State<Arc<AppState>>, headers: HeaderM
 
 /// Save config to disk and apply it immediately.
 async fn save_and_apply(state: &AppState, config: PanelConfig) -> Response {
+    if let Err(e) = config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid config: {}", e)})),
+        )
+            .into_response();
+    }
+    if let Err(e) = validate_runtime_settings(&config) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid runtime config: {}", e)})),
+        )
+            .into_response();
+    }
+
     let config_path = crate::config_loader::config_path();
     if let Err(e) = config.save(&config_path) {
         return (
@@ -324,19 +372,103 @@ async fn save_and_apply(state: &AppState, config: PanelConfig) -> Response {
         )
             .into_response();
     }
-    apply_config(state, config).await;
+    if let Err(e) = apply_config(state, config).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Failed to apply config: {}", e)})),
+        )
+            .into_response();
+    }
     Json(json!({"status": "applied"})).into_response()
 }
 
 /// Apply a new config: update settings, key pools, and model router.
-async fn apply_config(state: &AppState, config: PanelConfig) {
+async fn apply_config(state: &AppState, config: PanelConfig) -> Result<(), String> {
     let new_settings = Settings::from_panel_config(&config);
+    new_settings.validate_runtime_security()?;
     let active = config.active_profile().clone();
 
-    state.settings.store(Arc::new(new_settings));
+    state.settings.store(Arc::new(new_settings.clone()));
     state.panel_config.store(Arc::new(config));
     state.key_pool_manager.reload(&active).await;
     state.model_router.reload(&active).await;
+    state.rebuild_providers(&new_settings).await;
 
     info!("Configuration applied successfully");
+    Ok(())
+}
+
+fn validate_runtime_settings(config: &PanelConfig) -> Result<(), String> {
+    Settings::from_panel_config(config).validate_runtime_security()
+}
+
+fn masked_config(config: &PanelConfig) -> PanelConfig {
+    let mut masked = config.clone();
+    for profile in masked.profiles.values_mut() {
+        for value in profile.provider_keys.values_mut() {
+            *value = mask_key_list(value);
+        }
+    }
+    masked
+}
+
+fn mask_key_list(raw: &str) -> String {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(crate::key_pool::mask_key)
+        .collect::<Vec<_>>()
+        .join(" ; ")
+}
+
+fn preserve_masked_provider_keys(new_config: &mut PanelConfig, current: &PanelConfig) {
+    for (profile_key, new_profile) in &mut new_config.profiles {
+        if let Some(current_profile) = current.profiles.get(profile_key) {
+            preserve_masked_keys_for_profile(new_profile, current_profile);
+        }
+    }
+}
+
+fn preserve_masked_keys_for_profile(
+    new_profile: &mut ProfileConfig,
+    current_profile: &ProfileConfig,
+) {
+    for (provider, new_raw) in &mut new_profile.provider_keys {
+        let Some(current_raw) = current_profile.provider_keys.get(provider) else {
+            continue;
+        };
+        *new_raw = merge_masked_key_list(new_raw, current_raw);
+    }
+}
+
+fn merge_masked_key_list(new_raw: &str, current_raw: &str) -> String {
+    let new_parts: Vec<String> = new_raw
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let current_parts: Vec<String> = current_raw
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    if new_parts.is_empty() {
+        return String::new();
+    }
+
+    new_parts
+        .iter()
+        .enumerate()
+        .map(|(idx, candidate)| {
+            current_parts
+                .get(idx)
+                .filter(|old| candidate == &crate::key_pool::mask_key(old))
+                .cloned()
+                .unwrap_or_else(|| candidate.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(" ; ")
 }

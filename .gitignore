@@ -6,3 +6,10 @@ crustoxy-data
 debug
 .agent
 .claude
+.mcp.json
+CLAUDE.md
+CODEBASE_REVIEW.md
+VALIDATION_FIXES.md
+VALIDATION_REVIEW.md
+.claude-flow
+.swarm

@@ -35,15 +35,15 @@ Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely in
 
 - **Blazing Fast & Lightweight**: Written in pure Rust using `axum`, boasting near-zero proxy latency and an extremely minimal memory footprint perfect for long-running daemonized processes.
 - **Anthropic ↔ OpenAI Compat API**: Automatically translates Anthropic's complex proprietary API requests (such as `messages`, `system`, `tools`, `thinking`) into standard, universally accepted OpenAI-compatible API requests. It then seamlessly streams the responses back using Anthropic's exact SSE (Server-Sent Events) formatting and event sequences.
-- **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Puter, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, driven directly by your simple `.env` configuration.
+- **Out-of-the-box 24+ Provider Support**: Natively integrates with 24 major LLM platforms (OpenRouter, DeepSeek, Puter, Groq, Ollama, etc.) by automatically defining base URLs and mapping provider-specific quirks, managed from the Web UI and persisted in `config.toml`.
 - **Embedded Web UI Dashboard**: A beautifully designed "Nothing OS" style configuration panel built directly into the proxy. Manage your profiles, API keys, model mappings, and monitor live proxy health—all without restarting the server.
 - **Smart Model Auto-Routing & Fallback**: Define multiple provider/model combinations per Claude tier (`opus`, `sonnet`, `haiku`). The internal router load-balances traffic across models (Round-Robin, Random, or Least-Errors) and seamlessly falls back to the next healthy model mid-stream if a provider goes down.
 - **API Key Pooling & Rotation**: Avoid rate limits by attaching multiple API keys to a single provider. Keys are automatically cycled on each request. If a key hits a `429 Rate Limit`, it is temporarily placed on a smart cooldown and skipped until it recovers.
 - **Smart 429 Rate Limit Deflection**:
   - Proactive algorithmic sliding window rate limiter that intelligently throttles concurrent bursts *before* provider limits are hit.
   - Reactive blocking with customizable exponential backoff and jitter retries when an HTTP `429` is eventually encountered.
-- **RTK Token Optimization (System Prompt Compact)**: Automatically compacts Claude Code's notoriously large system prompts (often 4,000+ tokens) into a concise, factual RTK-style format (as low as 200–300 tokens) by extracting essential metadata (workspace, platform, OS) and discarding boilerplate. Saves significant token budget on every turn. Optional full override via `OVERRIDE_SYSTEM_PROMPT`.
-- **Automated IP Rotation (Anti-WAF Shield)**: Actively communicates with a localized `warp-svc` daemon to automatically trigger `warp-cli` disconnection and registration renewal sequences, rotating your public Cloudflare WARP IPv4/IPv6 if all passive rate-limit retries fail to bypass IP-based blocks.
+- **RTK Token Optimization (System Prompt Compact)**: Automatically compacts Claude Code's notoriously large system prompts (often 4,000+ tokens) into a concise, factual RTK-style format (as low as 200–300 tokens) by extracting essential metadata (workspace, platform, OS) and discarding boilerplate. Saves significant token budget on every turn. Optional full override via the panel's system prompt override.
+- **Optional IP Rotation (Anti-WAF Shield)**: When explicitly enabled, communicates with a localized `warp-svc` daemon to trigger `warp-cli` disconnection and registration renewal sequences, rotating your public Cloudflare WARP IPv4/IPv6 if all passive rate-limit retries fail to bypass IP-based blocks.
 - **Zero-Latency Agentic Mocking**: Intercepts expensive internal Claude Code workspace telemetry calls (such as Quota probing, conversation title generation, and OS filepath constraint extraction) and mocks the responses instantly on the edge, bypassing wasteful API roundtrips and heavily saving token costs.
 - **Advanced Think & Thought Tag Extraction**: Stateful stream parsing that intercepts inline deep-reasoning tags (`<think>...` or `<thought>...`) emitted by Open-Weights models on-the-fly, safely relocating their contents into pure, native Anthropic `thinking` blocks without interrupting the main text stream.
 - **Heuristic Tool Parser Fallback**: A two-tiered safety net that statically heals structurally malformed/garbled JSON tool schemas, and dynamically detects raw text tool calls (e.g., `<function=Name><parameter=key>value</parameter>`) natively emitted by Open-Weights models. It parses their geometry on-the-fly and accurately converts them into valid Anthropic structured JSON tool call events.
@@ -58,7 +58,7 @@ Through **Crustoxy**, this proxy bridges Claude Code's capabilities to freely in
 ### 1. Prerequisites (For Native Setup)
 
 Ensure you have **Rust** and **Cargo** installed globally. 
-If you plan to use `ENABLE_IP_ROTATION=true` natively (without Docker), you **must** install Cloudflare WARP (`warp-cli`):
+If you plan to enable IP Rotation natively (without Docker), you **must** install Cloudflare WARP (`warp-cli`) and enable `enable_ip_rotation` in the Web UI:
 
 **Ubuntu / Debian Installation:**
 ```bash
@@ -76,23 +76,23 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
    cd crustoxy
    cp .env.example .env
    ```
-   *Note: `.env` is now strictly for deployment variables (`HOST`, `PORT`, `ANTHROPIC_AUTH_TOKEN`). All proxy configuration is done through the Web UI.*
+   *Note: `.env` is strictly for deployment variables (`HOST`, `PORT`, `ANTHROPIC_AUTH_TOKEN`, Docker bind/WARP toggles). The Web UI is the single source of truth for proxy configuration and writes `~/.config/crustoxy/config.toml`.*
 
 3. **Build & Run Locally**
    ```bash
    cargo build --release
    ./target/release/crustoxy
    ```
-   *The server will start on `http://127.0.0.1:8082`*.
+   *The server will start on `http://127.0.0.1:8082` by default. Leaving `ANTHROPIC_AUTH_TOKEN` empty is only appropriate for localhost-only binding.*
 
 4. **First-Time Setup (Web Dashboard)**
    Open your browser and navigate to:
    **`http://127.0.0.1:8082/ui`**
    
-   Configure your proxy via the **Nothing OS-styled dashboard**:
+   Configure your proxy via the dashboard:
    - Add multiple API keys per provider (automatically pooled and rotated).
    - Configure model routing per Claude tier (`opus`, `sonnet`, `haiku`).
-   - Toggle features like IP Rotation and RTK Prompt Compact.
+   - Toggle features like IP Rotation and RTK Prompt Compact. IP Rotation still requires a running WARP daemon.
    - Click "Save & Apply" to hot-reload the proxy instantly.
 
 5. **Connect Claude Code via CLI**
@@ -135,33 +135,43 @@ sudo apt-get update && sudo apt-get install cloudflare-warp
 
 ## 🐳 Docker Deployment
 
-The project includes a `docker-compose.yaml` to spin up the Rust binary on an ultra-slim Debian runtime pre-installed with `warp-cli` for automated IP rotation.
+The project includes a `docker-compose.yaml` for the Rust binary on a slim Debian runtime. Docker deployments fail closed: set `ANTHROPIC_AUTH_TOKEN` in `.env` before starting Compose. The host port binds to `127.0.0.1` unless you explicitly set `CRUSTOXY_LISTEN_ADDR=0.0.0.0`.
 
 ```bash
-# 1. Edit .env and tweak docker-compose if necessary
+# 1. Copy .env.example to .env and set ANTHROPIC_AUTH_TOKEN
 # 2. Start the service
-docker-compose up -d --build
+docker compose up -d --build
 
 # Note: For Kimi OAuth interactive login, attach to the container:
 # docker attach crustoxy
-docker-compose logs -f
+docker compose logs -f
 ```
+
+Cloudflare WARP is disabled in the default service and no privileged Linux capabilities are granted. To opt in, stop the default service if it is running and start the profiled service directly:
+
+```bash
+docker compose stop crustoxy
+docker compose --profile warp up -d crustoxy-warp
+```
+
+The WARP profile grants `NET_ADMIN` and `/dev/net/tun`, and sets `CRUSTOXY_ENABLE_WARP=true` for that container.
 
 ---
 
 ## ⚙️ Configuration Parameters
 
-You can fine-tune Crustoxy to fit your exact infrastructure requirements via the **Web UI Dashboard** (which saves to `~/.config/crustoxy/config.toml`). Below are the key configurations and what they govern:
+You can fine-tune Crustoxy via the **Web UI Dashboard**. The panel writes the persistent single source of truth at `~/.config/crustoxy/config.toml` (or `./data/config.toml` when using the provided Docker volume). Do not split model, provider, key, routing, or feature configuration into `.env`.
 
 ### 1. Server Configuration
-- `HOST` *(default: `0.0.0.0`)*: The network interface the proxy runs on.
+- `HOST` *(default: `127.0.0.1` natively; `0.0.0.0` inside Compose)*: The network interface the proxy runs on.
 - `PORT` *(default: `8082`)*: The port the proxy listens on.
-- `ANTHROPIC_AUTH_TOKEN`: Optional. Defines an arbitrary static Bearer token used to secure Crustoxy. If filled, Claude Code CLI must use the matching value in its `ANTHROPIC_AUTH_TOKEN` environment variable. Leave blank for no auth.
+- `ANTHROPIC_AUTH_TOKEN`: Static Bearer token used to secure Crustoxy. Leave blank only when the service is bound to localhost. Docker Compose requires this value before startup.
 
 ### 2. Model Mapping
 Claude Code inherently delegates tasks between `opus`, `sonnet`, and `haiku` models implicitly. Crustoxy redirects these to the models of your choosing:
-- `MODEL_OPUS` / `MODEL_SONNET` / `MODEL_HAIKU`: Format using `provider_id/model_id` (e.g., `groq/llama3-8b-8192`).
-- `MODEL`: The fallback unified model router if a specific subset isn't defined.
+- Configure `default`, `opus`, `sonnet`, and `haiku` in the Web UI Model Mapping page.
+- Values use `provider_id/model_id` format (for example `groq/llama3-8b-8192`).
+- The `default` tier is the fallback unified model router if a specific tier is not defined.
 
 ### 3. Routing & Load Balancing Strategies
 When configuring multiple models per tier or multiple API keys per provider (separated by newlines in the Web UI), Crustoxy uses your chosen routing strategy to distribute the load:
@@ -173,25 +183,25 @@ When configuring multiple models per tier or multiple API keys per provider (sep
 
 ### 4. Rate Limiting & Concurrency
 Crustoxy employs algorithmic Sliding Window limits to prevent your account from hitting provider throttles too aggressively.
-- `PROVIDER_RATE_LIMIT` *(default: `40`)*: The amount of requests allowed during the window.
-- `PROVIDER_RATE_WINDOW` *(default: `60`)*: The timeframe in seconds where the rate limit applies.
-- `PROVIDER_MAX_CONCURRENCY` *(default: `5`)*: Hard caps how many simultaneous HTTP requests can be inflight to the provider. Any excess requests will cleanly wait in queue.
+- `provider_rate_limit` *(default: `40`)*: The amount of requests allowed during the window.
+- `provider_rate_window` *(default: `60`)*: The timeframe in seconds where the rate limit applies.
+- `provider_max_concurrency` *(default: `5`)*: Hard caps how many simultaneous HTTP requests can be inflight to the provider. Any excess requests will cleanly wait in queue.
 
 ### 5. HTTP Settings
-- `HTTP_READ_TIMEOUT` *(default: `300`)*: Max time in seconds to keep a stream connection alive while waiting for inference tokens. High values are recommended for deep reasoning models.
-- `HTTP_CONNECT_TIMEOUT` *(default: `10`)*: Max time in seconds allowed to establish the initial HTTP handshake with a provider.
+- `http_read_timeout` *(default: `300`)*: Max time in seconds to keep a stream connection alive while waiting for inference tokens. High values are recommended for deep reasoning models.
+- `http_connect_timeout` *(default: `10`)*: Max time in seconds allowed to establish the initial HTTP handshake with a provider.
 
 ### 6. IP Rotation
-- `ENABLE_IP_ROTATION` *(default: `true`)*: If set to true, seamlessly communicates with `warp-cli` to switch IP allocations when a provider enforces persistent IP-based `429` blocks. (Requires Cloudflare WARP daemon).
+- `enable_ip_rotation` *(default: disabled unless enabled in the panel)*: If enabled, communicates with `warp-cli` to switch IP allocations when a provider enforces persistent IP-based `429` blocks. Requires Cloudflare WARP daemon. Docker also requires the `warp` Compose profile.
 
 ### 7. RTK System Prompt Optimization
-- `ENABLE_RTK` *(default: `true`)*: When enabled, Claude Code's massive default system prompt (4,000–8,000 tokens) is automatically compacted into a concise RTK-style factual summary (200–300 tokens). Essential metadata (workspace path, OS platform, OS version) is preserved; repetitive instructional boilerplate is stripped.
-- `OVERRIDE_SYSTEM_PROMPT`: Leave blank to use RTK-compacted prompt. Set to any text string to fully replace the system prompt sent to the provider, bypassing both the original and the RTK-compacted version.
+- `enable_rtk` *(default: configurable in the panel)*: When enabled, Claude Code's massive default system prompt (4,000–8,000 tokens) is automatically compacted into a concise RTK-style factual summary (200–300 tokens). Essential metadata (workspace path, OS platform, OS version) is preserved; repetitive instructional boilerplate is stripped.
+- `override_system_prompt`: Leave blank to use RTK-compacted prompt. Set to any text string to fully replace the system prompt sent to the provider, bypassing both the original and the RTK-compacted version.
 
 ### 8. Optimizations & Safety Nets
-- `ENABLE_NETWORK_PROBE_MOCK` / `ENABLE_TITLE_GENERATION_SKIP` / `ENABLE_SUGGESTION_MODE_SKIP` / `ENABLE_FILEPATH_EXTRACTION_MOCK`: Set to `true` to intercept internal telemetry and UI-aesthetic requests heavily spammed by Claude Code. Crustoxy mocks perfect responses instantly, slashing your API token costs heavily.
-- `ENABLE_TOOL_RETRY` *(default: `true`)*: Activates the active Auto-Retry Pipeline. When set to true, if a model writes sentences indicating it wants to use a tool (e.g. "Let me run a command") but fails to actually output the structured tool JSON, Crustoxy will silently push the context back and force the model to retry.
-- `TOOL_RETRY_MAX` *(default: `2`)*: The maximum amount of times Crustoxy is allowed to automatically retry the provider per single user prompt.
+- `enable_network_probe_mock` / `enable_title_generation_skip` / `enable_suggestion_mode_skip` / `enable_filepath_extraction_mock`: Panel toggles that intercept internal telemetry and UI-aesthetic requests heavily spammed by Claude Code. Crustoxy mocks perfect responses instantly, slashing your API token costs heavily.
+- `enable_tool_retry` *(default: configurable in the panel)*: Activates the active Auto-Retry Pipeline. When enabled, if a model writes sentences indicating it wants to use a tool (e.g. "Let me run a command") but fails to output structured tool JSON, Crustoxy will silently push the context back and force the model to retry.
+- `tool_retry_max` *(default: `2`)*: The maximum amount of times Crustoxy is allowed to automatically retry the provider per single user prompt.
 
 ---
 
@@ -233,17 +243,17 @@ There are two independent axes of load balancing happening simultaneously:
 
 | Dimension | What It Balances | Configured Via |
 | :--- | :--- | :--- |
-| **Model Routing** | Distributes requests across multiple `provider/model` combinations per Claude tier | `MODEL_OPUS`, `MODEL_SONNET`, `MODEL_HAIKU` |
+| **Model Routing** | Distributes requests across multiple `provider/model` combinations per Claude tier | Web UI Model Mapping / `config.toml` |
 | **Key Pool Rotation** | Distributes requests across multiple API keys per provider | Provider API Keys |
 
 **Example configuration:**
 ```toml
 # Model tier with 2 providers (round-robin between them)
-MODEL_SONNET = "openrouter/deepseek-r1 ; deepinfra/deepseek-r1"
+model_mapping.sonnet = "openrouter/deepseek-r1 ; deepinfra/deepseek-r1"
 
 # Each provider has its own key pool (round-robin per provider)
-OPENROUTER_API_KEY = "sk-or-key-A ; sk-or-key-B ; sk-or-key-C"
-DEEPINFRA_API_KEY  = "di-key-X ; di-key-Y"
+provider_keys.openrouter = "sk-or-key-A ; sk-or-key-B ; sk-or-key-C"
+provider_keys.deepinfra  = "di-key-X ; di-key-Y"
 ```
 
 With this config, Crustoxy will:
@@ -344,7 +354,13 @@ INFO  STREAM_OK:       request_id=req_abc provider=deepinfra model=deepseek-r1 k
 
 ## 🔄 WARP IP Rotation Mode
 
-When `ENABLE_IP_ROTATION=true` in `.env`, the router will actively communicate with a local Cloudflare WARP daemon. 
+When `enable_ip_rotation` is enabled in the Web UI, the router will actively communicate with a local Cloudflare WARP daemon. Native deployments must start WARP themselves. Docker deployments must use the explicit WARP profile:
+
+```bash
+docker compose stop crustoxy
+docker compose --profile warp up -d crustoxy-warp
+```
+
 If an API provider throws a `429 Too Many Requests` error and all internal exponential retries fail, it triggers a thread-safe native sequence to:
 1. `warp-cli disconnect`
 2. `warp-cli registration delete`
