@@ -107,12 +107,37 @@ pub async fn rotate_ip() -> Result<(), String> {
     Ok(())
 }
 
+/// Returns `true` when the container was started with the WARP daemon running.
+/// Driven by the `CRUSTOXY_ENABLE_WARP` env var that `entrypoint.sh` already
+/// uses to decide whether to launch `warp-svc`.
+fn warp_runtime_available() -> bool {
+    std::env::var("CRUSTOXY_ENABLE_WARP")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Sync WARP connection state based on the provided flag.
 ///
-/// Failures are logged at WARN level (instead of being silently swallowed) so
-/// operators running in non-WARP containers can see why IP rotation isn't
-/// taking effect.
+/// Short-circuits when the container does not run the WARP daemon
+/// (`CRUSTOXY_ENABLE_WARP != true`) so we don't spam warnings on every
+/// hot-reload. When the runtime *is* WARP-capable, failures are logged at
+/// WARN so operators can see why rotation isn't taking effect.
 pub async fn sync_warp_state(enabled: bool) {
+    if !warp_runtime_available() {
+        // Container started without the WARP daemon. Nothing we do with
+        // `warp-cli` will succeed. Inform the operator only when they have
+        // explicitly *requested* rotation, so the misconfiguration is
+        // surfaced exactly once per toggle.
+        if enabled {
+            warn!(
+                "enable_ip_rotation=true but CRUSTOXY_ENABLE_WARP is not set — \
+                 WARP daemon is not running. Restart the container with \
+                 CRUSTOXY_ENABLE_WARP=true (and the 'warp' compose profile) to use IP rotation."
+            );
+        }
+        return;
+    }
+
     let lock = get_lock();
     let _guard = lock.lock().await;
 
